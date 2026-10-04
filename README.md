@@ -12,7 +12,7 @@ The local adaptation was verified with **DSH 0.2.0-rc.2** and **desktop 2.0.17**
 - Browser checks covered 192 cases and 2,320 assertions across four viewport sizes.
 - Review was completed. Browser checks used mocked services and are not a production full-chat validation.
 
-Gateway availability, quotas, protocol support and actual reasoning behavior depend on the upstream service. This adaptation does not establish that `upstream_error` is resolved.
+Gateway availability, quotas, protocol support and actual reasoning behavior depend on the upstream service.
 
 ## Install This Fork
 
