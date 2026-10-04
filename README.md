@@ -8,7 +8,7 @@ Connect a [Sub2API](https://github.com/Wei-Shaw/sub2api) gateway to [DeepSeek Ha
 
 The local adaptation was verified with **DSH 0.2.0-rc.2** and **desktop 2.0.17**. Other versions are not covered by this verification.
 
-- The original adaptation's 136 automated tests and server/client typechecks passed. The release copy adds one packaging test, for 137 passing tests in total.
+- The original adaptation's 136 automated tests and server/client typechecks passed. The release copy adds packaging and bounded cross-platform test-wait regressions, for 138 passing tests in total.
 - Browser checks covered 192 cases and 2,320 assertions across four viewport sizes.
 - Review was completed. Browser checks used mocked services and are not a production full-chat validation.
 
