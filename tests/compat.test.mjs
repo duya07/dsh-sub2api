@@ -3,21 +3,29 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import test from 'node:test'
-import { Context } from '@deepseek-ai/cordis'
-import SettingsProvider from '@deepseek-ai/dsh-settings'
 import { Config as PiConfig } from '@deepseek-ai/dsh-llm-pi-ai'
-import { Config, translateToPiAi, syncPiAiProfiles } from '../lib/index.js'
+import { translateToPiAi } from '../lib/index.js'
 
-const config = () => Config({
+/**
+ * A plain configuration literal. `Config({...})` no longer resolves to plain
+ * values on DSH 0.2 — a volatile schema field resolves to a live cell — so the
+ * checks below use the shape the bridge consumes. The cell path is covered in
+ * `dsh02-contract.test.mjs`.
+ */
+const config = () => ({
   baseURL: 'https://gateway.test/v1',
   providers: Object.fromEntries(['openai', 'claude', 'grok'].map(key => [key, {
     apiKeyEnv: `TEST_${key.toUpperCase()}`,
     models: [{ id: `${key}-test`, reasoningEfforts: ['none', 'high', 'max'] }],
   }])),
+  tools: { generate: { provider: 'sub2api-openai', model: 'openai-test' } },
 })
 
 test('all gateway routes satisfy the current pi-ai schema', () => {
-  const { providers } = PiConfig({ providers: translateToPiAi(config()) })
+  // pi-ai declares `providers` volatile, so on 0.2 the parsed section hands
+  // back a live cell rather than the profiles themselves.
+  const parsed = PiConfig({ providers: translateToPiAi(config()) }).providers
+  const providers = typeof parsed?.get === 'function' ? parsed.get() : parsed
   assert.equal(Object.keys(providers).length, 3)
   assert.equal(providers['sub2api-claude'].baseURL, 'https://gateway.test')
   assert.equal(providers['sub2api-claude'].api, 'anthropic-messages')
@@ -27,46 +35,38 @@ test('all gateway routes satisfy the current pi-ai schema', () => {
   assert.deepEqual(providers['sub2api-openai'].models[0].reasoningEfforts, {off: 'none', high: 'high', max: 'max'})
 })
 
-test('new settings service installs, hot-updates and removes bridged profiles', async () => {
-  class MemorySettings extends SettingsProvider {
-    writable = true
-    async load() { return {} }
-    async persist() {}
-  }
-  const ctx = new Context()
-  const service = ctx.plugin(MemorySettings)
-  await service.await()
-  let current = config
-  let sync = Promise.resolve()
-  const consumer = ctx.plugin({
-    inject: ['settings'],
-    apply(owner) {
-      owner.settings.register('llm-pi-ai', PiConfig, {base: {providers: {}}})
-      owner.settings.installSection(owner, 'llm-sub2api', Config, config(), {
-        setSource(source) { current = source },
-        onChange() { sync = syncPiAiProfiles(owner, current()) },
-      })
-    },
-  })
-  try {
-    await consumer.await()
-    await sync
-    assert.equal(Object.keys(ctx.settings.get('llm-pi-ai').providers).length, 3)
-    const unrelated = {api: 'openai-completions', baseURL: 'https://other.test/v1', models: [{id: 'other'}]}
-    await ctx.settings.update('llm-pi-ai', {providers: {external: unrelated, 'sub2api-gemini': unrelated}})
-    await ctx.settings.update('llm-sub2api', {baseURL: ''})
-    await new Promise(resolve => setImmediate(resolve))
-    await sync
-    assert.deepEqual(Object.keys(ctx.settings.get('llm-pi-ai').providers), ['external'])
-    await ctx.settings.update('llm-sub2api', {baseURL: 'https://new.test'})
-    await new Promise(resolve => setImmediate(resolve))
-    await sync
-    assert.equal(ctx.settings.get('llm-pi-ai').providers['sub2api-openai'].baseURL, 'https://new.test/v1')
-  } finally {
-    await consumer.dispose()
-    await service.dispose()
-  }
+test('endpoint lists keep legacy route ids and carry their own host and protocol', () => {
+  const endpoint = over => ({platform: 'openai', apiKeyEnv: 'KEY', models: [{id: 'm'}], ...over})
+  // An unnamed endpoint that is alone on its platform keeps the historical route
+  // id, so existing agent presets and default-model settings keep resolving.
+  const single = translateToPiAi({baseURL: 'https://legacy.test/v1', providers: {}, endpoints: [endpoint({})]})
+  assert.deepEqual(Object.keys(single), ['sub2api-openai'])
+  assert.equal(single['sub2api-openai'].baseURL, 'https://legacy.test/v1')
+  assert.equal('sub2api-claude' in single, false)
+  // A named endpoint becomes its own route and uses its own host, not the section one.
+  const named = translateToPiAi({baseURL: 'https://legacy.test/v1', providers: {}, endpoints: [
+    endpoint({name: 'Team A', baseURL: 'https://a.test', apiKeyEnv: 'A', models: [{id: 'only-a'}]}),
+    endpoint({name: 'Team B', baseURL: 'https://b.test/v1', platform: 'claude', apiKeyEnv: 'B', models: [{id: 'only-b'}]}),
+  ]})
+  assert.deepEqual(Object.keys(named).sort(), ['sub2api-claude-team-b', 'sub2api-openai-team-a'])
+  assert.equal(named['sub2api-openai-team-a'].baseURL, 'https://a.test/v1')
+  assert.equal(named['sub2api-claude-team-b'].baseURL, 'https://b.test')
+  assert.equal(named['sub2api-claude-team-b'].api, 'anthropic-messages')
+  // Two unnamed entries on one platform are numbered instead of colliding.
+  const pair = translateToPiAi({baseURL: 'https://legacy.test', providers: {}, endpoints: [endpoint({apiKeyEnv: '1'}), endpoint({apiKeyEnv: '2'})]})
+  assert.deepEqual(Object.keys(pair).sort(), ['sub2api-openai-1', 'sub2api-openai-2'])
+  // An entry with no key, or with no model, can never be called, so it is skipped.
+  assert.deepEqual(translateToPiAi({baseURL: 'https://legacy.test', providers: {}, endpoints: [endpoint({apiKeyEnv: undefined}), endpoint({models: []})]}), {})
+  // An explicit protocol override wins over the platform default.
+  const overridden = translateToPiAi({baseURL: 'https://legacy.test', providers: {}, endpoints: [endpoint({api: 'openai-completions'})]})
+  assert.equal(overridden['sub2api-openai'].api, 'openai-completions')
 })
+
+// The 0.1.x settings test that lived here drove `SettingsProvider` through
+// `register`, `installSection` and `get`, none of which exist on 0.2.0-rc.2.
+// Its three concerns — the section installs, a volatile-only change re-bridges
+// without a remount, and routes this plugin does not own survive — are covered
+// against the 0.2 contract in `dsh02-contract.test.mjs`.
 
 test('browser bundle registers settings and renders running/settled image tools', () => {
   const require = createRequire(import.meta.url)
@@ -88,7 +88,7 @@ test('browser bundle registers settings and renders running/settled image tools'
 })
 
 test('legacy Gemini and auto-vision settings do not create routes', () => {
-  const legacy = Config({...config(), autoVision: true, providers: {...config().providers, gemini: {apiKeyEnv: 'OLD', models: [{id: 'old'}]}}})
+  const legacy = {...config(), autoVision: true, providers: {...config().providers, gemini: {apiKeyEnv: 'OLD', models: [{id: 'old'}]}}}
   assert.deepEqual(Object.keys(translateToPiAi(legacy)), ['sub2api-openai', 'sub2api-claude', 'sub2api-grok'])
 })
 
@@ -102,7 +102,9 @@ test('settings save manual capabilities, preserve edits during metadata fill, an
   let observerDisconnected = false
   const timers = new Map()
   let timerId = 0
-  const fixture = {baseURL: 'https://gateway.test', catalogFormat: 'structured-v1', providers: {openai: {keyConfigured: true, models: [{id: 'test-model', input: ['text'], reasoningEfforts: ['low']}]}}}
+  const fixture = {baseURL: 'https://gateway.test', catalogFormat: 'structured-v1', endpoints: [
+    {name: 'OpenAI', baseURL: 'https://gateway.test', platform: 'openai', apiKeyEnv: 'SUB2API_OPENAI_API_KEY', keyConfigured: true, api: '', route: 'sub2api-openai', models: [{id: 'test-model', input: ['text'], reasoningEfforts: ['low']}]},
+  ]}
   vm.runInNewContext(readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'), {
     window: {__ModuleLoader__: {load({factory}) { plugin = factory(require) }}, setTimeout(callback) { timers.set(++timerId, callback); return timerId }, clearTimeout(id) {timers.delete(id)}},
     getComputedStyle: element => element,
@@ -120,15 +122,19 @@ test('settings save manual capabilities, preserve edits during metadata fill, an
   try {
     assert.equal(footerStyles['--s2a-footer-inset'], '24px')
     assert.equal(view.root.findAllByProps({className: 's2a_rowTag'}).some(n => n.children.includes('sub2api-gemini')), false)
-    await act(async () => {view.root.findAllByProps({className: 's2a_iconBtn s2a_expandBtn'})[0].props.onClick()})
+     assert.ok(view.root.findAllByProps({className: 's2a_rowTag'}).some(n => n.children.includes('sub2api-openai')))
+     await act(async () => {view.root.findByProps({className: 's2a_iconBtn s2a_endpointToggle'}).props.onClick()})
+     await act(async () => {view.root.findAllByProps({className: 's2a_iconBtn s2a_expandBtn'})[0].props.onClick()})
     const field = label => view.root.findByProps({'aria-label': `OpenAI test-model ${label}`})
     await act(async () => {field('图片输入').props.onChange({target: {value: 'text-image'}}); field('思考强度档位').props.onChange({target: {value: 'none, high, max'}})})
     const button = text => view.root.findAllByType('button').find(n => n.children.includes(text))
     await act(async () => {await button('补全数据').props.onClick()})
     await act(async () => {await button('保存配置').props.onClick()})
-    assert.deepEqual(saved.providers.openai.models[0].input, ['text', 'image'])
-    assert.deepEqual(saved.providers.openai.models[0].reasoningEfforts, ['none', 'high', 'max'])
-    assert.deepEqual(Object.keys(saved.providers), ['openai', 'claude', 'grok'])
+    assert.deepEqual(saved.endpoints[0].models[0].input, ['text', 'image'])
+    assert.deepEqual(saved.endpoints[0].models[0].reasoningEfforts, ['none', 'high', 'max'])
+    assert.equal(saved.providers, undefined)
+    assert.equal(saved.endpoints[0].apiKeyEnv, 'SUB2API_OPENAI_API_KEY')
+    assert.equal(saved.endpoints.length, 1)
     assert.equal('analyze' in saved.tools, false)
     assert.equal(view.root.findAllByProps({'aria-label': '识图模型'}).length, 0)
     await act(async () => {field('思考强度档位').props.onChange({target: {value: 'invalid'}})})
@@ -139,11 +145,82 @@ test('settings save manual capabilities, preserve edits during metadata fill, an
     assert.equal(view.root.findAllByProps({role: 'status'}).length, 0)
     await act(async () => {field('思考模式').props.onChange({target: {value: 'off'}})})
     await act(async () => {await button('保存配置').props.onClick()})
-    assert.deepEqual(saved.providers.openai.models[0].reasoningEfforts, [])
+    assert.deepEqual(saved.endpoints[0].models[0].reasoningEfforts, [])
     await act(async () => {for (const callback of timers.values()) callback()})
     assert.equal(view.root.findAllByProps({role: 'status'}).length, 0)
   } finally {await act(async () => view.unmount())}
   assert.equal(observerDisconnected, true)
+})
+
+test('the first endpoint on a platform keeps the historical credential reference', async () => {
+  const { endpointCredentialRef } = await import('../src/routes.ts')
+  // A key stored before endpoint lists existed must keep working as the sole
+  // openai endpoint, or upgrading would silently lose every configured key.
+  assert.equal(endpointCredentialRef('openai', '', []), 'SUB2API_OPENAI_API_KEY')
+  assert.equal(endpointCredentialRef('claude', 'Anything', []), 'SUB2API_CLAUDE_API_KEY')
+  // Later endpoints get their own reference so each key is stored separately.
+  const first = {platform: 'openai', apiKeyEnv: 'SUB2API_OPENAI_API_KEY'}
+  assert.equal(endpointCredentialRef('openai', 'Team A', [first]), 'SUB2API_OPENAI_TEAM_A_API_KEY')
+  assert.equal(endpointCredentialRef('openai', '', [first]), 'SUB2API_OPENAI_API_KEY_2')
+  // A colliding name must not overwrite the key another entry already owns.
+  const taken = {platform: 'openai', apiKeyEnv: 'SUB2API_OPENAI_TEAM_A_API_KEY'}
+  assert.equal(endpointCredentialRef('openai', 'Team A', [taken]), 'SUB2API_OPENAI_TEAM_A_API_KEY_2')
+})
+
+test('saving an endpoint list stores each key and reports the resolved routes', async () => {
+  const { registerRoutes } = await import('../src/routes.ts')
+  const handlers = []
+  const stored = new Map()
+  let config = {baseURL: '', providers: {openai: {}, claude: {}, grok: {}}}
+  const credentials = {
+    async resolve(ref) {return stored.has(ref) ? {value: stored.get(ref), source: 'file'} : undefined},
+    async describe(ref) {return {configured: stored.has(ref), writable: true, ...(stored.has(ref) ? {source: 'file'} : {})}},
+    async set(ref, value) {stored.set(String(ref), value)},
+    async unset(ref) {stored.delete(ref)},
+  }
+  registerRoutes({
+    inject(_deps, callback) {callback({webServer: {register(entry) {handlers.push(entry)}}, effect(callback) {callback()}})},
+    get(name) {return name === 'credentials' ? credentials : undefined},
+  }, {
+    config: () => config,
+    setConfig: next => {config = next},
+    listRegisteredRoutes: () => ['sub2api-openai'],
+    resolveApiKey: async () => 'stored-key',
+  })
+  const entry = handlers.find(handler => handler.path === '/plugins/dsh-sub2api/config')
+  const call = async (method, body) => {
+    const payload = body === undefined ? '' : JSON.stringify(body)
+    const req = {
+      method,
+      socket: {remoteAddress: '127.0.0.1'},
+      headers: {host: '127.0.0.1:43120'},
+      async *[Symbol.asyncIterator]() {if (payload.length > 0) yield Buffer.from(payload)},
+    }
+    let status = 0, text = ''
+    await entry.handler(req, {writeHead(code) {status = code}, end(chunk) {text = chunk ?? ''}})
+    return {status, body: text.length > 0 ? JSON.parse(text) : undefined}
+  }
+  // Entries carry their own host, so the request needs no section-level URL.
+  const saved = await call('POST', {baseURL: '', endpoints: [
+    {name: '', baseURL: 'https://a.test', platform: 'openai', apiKey: 'sk-a', api: '', models: [{id: 'only-a'}]},
+    {name: 'Team B', baseURL: 'https://b.test', platform: 'claude', apiKey: 'sk-b', api: '', models: [{id: 'only-b'}]},
+  ]})
+  assert.equal(saved.status, 200)
+  assert.equal(config.endpoints.length, 2)
+  // The first entry on a platform keeps the pre-existing reference, so a key
+  // configured before this feature keeps working after the upgrade.
+  assert.equal(config.endpoints[0].apiKeyEnv, 'SUB2API_OPENAI_API_KEY')
+  assert.equal(config.endpoints[1].apiKeyEnv, 'SUB2API_CLAUDE_TEAM_B_API_KEY')
+  assert.deepEqual([...stored.values()].sort(), ['sk-a', 'sk-b'])
+  const view = await call('GET')
+  assert.equal(view.status, 200)
+  assert.deepEqual(view.body.endpoints.map(endpoint => endpoint.route), ['sub2api-openai', 'sub2api-claude-team-b'])
+  assert.deepEqual(view.body.endpoints.map(endpoint => endpoint.keyConfigured), [true, true])
+  assert.equal(JSON.stringify(view.body).includes('sk-a'), false)
+  // A request that carries no endpoints key (an older page) must not drop them.
+  const legacy = await call('POST', {baseURL: 'https://legacy.test', providers: {}})
+  assert.equal(legacy.status, 200)
+  assert.equal(config.endpoints.length, 2)
 })
 
 test('only the image-generation tool and prompt are registered', async () => {

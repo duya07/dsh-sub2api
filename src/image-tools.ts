@@ -26,6 +26,7 @@ import {
   type ProviderKey,
   type ProviderProfile,
 } from './index.ts'
+import { endpointRoute } from './pi-ai.ts'
 
 interface ImageFsTarget {
   displayPath: string
@@ -145,6 +146,29 @@ function resolveToolModel(config: Config, kind: 'generate'): ResolvedToolModel {
   const model = typeof ref?.model === 'string' ? ref.model.trim() : ''
   if (provider.length === 0 || model.length === 0) {
     throw new Error(`sub2api: 未配置${label}模型。打开设置 → Sub2API 模型，为「全局图像工具」指定一个模型后再试`)
+  }
+  const endpoints = config.endpoints ?? []
+  // Endpoint mode: `provider` names one entry's route id, so an image tool can
+  // bill a specific key when the gateway holds several keys per platform.
+  const endpoint = endpoints.find((entry) => endpointRoute(entry, endpoints) === provider)
+  if (endpoint !== undefined) {
+    const host = (endpoint.baseURL ?? '').trim().replace(/\/+$/, '') || config.baseURL.trim().replace(/\/+$/, '')
+    if (host.length === 0) throw new Error('sub2api: baseURL is not configured')
+    if (endpoint.apiKeyEnv === undefined) {
+      throw new Error(`sub2api: ${label}模型所在的端点未配置 API key，无法调用${label}模型`)
+    }
+    const api = endpoint.api ?? apiProtocolForKey(endpoint.platform, endpoint)
+    const endpointRoot = api === 'anthropic-messages' ? gatewayAnthropicRoot(host) : gatewayApiRoot(host)
+    const endpointModel = endpoint.models?.find((entry) => entry.id === model)
+    return {
+      route: provider,
+      label: endpoint.name?.trim() || PROVIDER_LABELS[endpoint.platform],
+      profile: endpoint,
+      model,
+      baseURL: endpointRoot,
+      api,
+      maxTokens: endpointModel?.maxTokens ?? DEFAULT_MAX_TOKENS,
+    }
   }
   if (!isProviderKey(provider)) {
     throw new Error(`sub2api: ${label}模型的平台 "${provider}" 无效，应为 openai / claude / grok`)

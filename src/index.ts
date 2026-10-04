@@ -21,7 +21,8 @@
  *
  * Keys are stored through the harness credential seam; the base URL and
  * per-key model catalogs live in the `llm-sub2api:` settings section
- * (`$DSH_HOME/settings.yaml`, written by the web Models page).
+ * (persisted by the harness into the active profile, written by the web Models
+ * page).
  *
  * @module dsh-sub2api
  */
@@ -34,9 +35,12 @@ import {
   assertUsableApiKey,
 } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-settings'
+// The loader owns the `loader/volatile-update` event; importing its types is
+// what adds that event to cordis's Events map. Type-only, so it erases.
+import type {} from '@deepseek-ai/cordis-plugin-loader'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { registerRoutes } from './routes.ts'
+import { ConfigSaveError, registerRoutes } from './routes.ts'
 import { registerImageTools } from './image-tools.ts'
 import { syncPiAiProfiles } from './pi-ai.ts'
 import { applyPiAiMultiTurnPatch } from './pi-ai-patch.ts'
@@ -133,6 +137,31 @@ export interface ProviderProfile {
   models?: CatalogModel[]
 }
 
+/**
+ * One independently-keyed sub2api endpoint.
+ *
+ * The shipped layout is one fixed slot per platform, which caps a user at a
+ * single gateway per platform: a second gateway — or a second group key on the
+ * same gateway — has nowhere to go. An endpoint list removes that cap. Every
+ * entry carries its own host and its own key; `platform` only decides which
+ * native wire protocol the entry speaks, because the gateway still serves
+ * openai groups through the Responses API and claude groups through Messages.
+ */
+export interface ProviderEndpoint {
+  /** Optional label; names the route and titles the settings-page row. */
+  name?: string
+  /** This entry's own gateway host. Absent falls back to the section `baseURL`. */
+  baseURL?: string
+  /** Sub2api platform group this key belongs to; decides the native protocol. */
+  platform: ProviderKey
+  /** Credential reference holding this entry's key. */
+  apiKeyEnv?: string
+  /** Wire-protocol override for this entry. */
+  api?: ApiProtocol
+  /** Advisory model catalog for this entry. */
+  models?: CatalogModel[]
+}
+
 /** One dedicated model used by a global image tool, independent of the chat route. */
 export interface ImageToolModelRef {
   /** Sub2API platform that owns the key and catalog (`openai` / `claude` / `grok`). */
@@ -151,8 +180,55 @@ export interface Config {
   baseURL: string
   /** Per-platform provider profiles keyed by sub2api platform name. */
   providers: Record<ProviderKey, ProviderProfile>
+  /**
+   * Independently-keyed endpoints. A non-empty list is the sole source of chat
+   * routes; {@link providers} then stays untouched as the legacy shape, so a
+   * section written by an older build keeps working. Absent or empty keeps the
+   * original one-slot-per-platform behaviour.
+   */
+  endpoints?: ProviderEndpoint[]
   /** Dedicated models for the global image-generation tools. */
   tools?: ImageToolsConfig
+}
+
+/**
+ * A live configuration cell. DSH 0.2's loader hands each `volatile()` schema
+ * field to `apply` as one of these frozen references instead of a plain value:
+ * it keeps the object identity and re-points the value in place when the
+ * configuration changes, then emits `loader/volatile-update` on this plugin's
+ * own context. Reading `.get()` is also what subscribes the plugin to that
+ * event — the loader only notifies plugins whose resolved config carries the
+ * references it collected.
+ */
+export interface Volatile<T> {
+  get(): T
+}
+
+/** Runtime brand cosmokit's `createVolatile` stamps onto a live cell. */
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
+/**
+ * The configuration `apply` receives. Every field declared volatile in
+ * {@link Config} arrives as a {@link Volatile} cell; fields are optional
+ * because a section that never stored a value still resolves — an unset
+ * `baseURL` is a live cell holding `undefined`.
+ */
+export interface ConfigInput {
+  baseURL?: Volatile<string | undefined>
+  providers?: Volatile<Record<ProviderKey, ProviderProfile>>
+  endpoints?: Volatile<ProviderEndpoint[]>
+  tools?: Volatile<ImageToolsConfig>
+}
+
+/**
+ * Read one configuration cell. The loader always supplies a volatile
+ * reference for a volatile schema field, but test fixtures call `apply` with
+ * plain literals, so both shapes are accepted.
+ */
+export function readVolatile<T>(value: Volatile<T> | T | undefined): T | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value === 'object' && VOLATILE_WRITE in value) return (value as Volatile<T>).get()
+  return value as T
 }
 
 const catalogModel = z.object({
@@ -185,6 +261,21 @@ const providerProfile = z.object({
   models: z.array(catalogModel),
 })
 
+/**
+ * One endpoint entry. `platform` is required: the wire protocol cannot be
+ * guessed from a host, and a wrong guess sends an Anthropic key to an OpenAI
+ * endpoint. `name` and `baseURL` stay optional so an unnamed entry on the
+ * section's default host still resolves to the legacy route id.
+ */
+const providerEndpoint = z.object({
+  name: z.string(),
+  baseURL: z.string(),
+  platform: z.union([z.const('openai'), z.const('claude'), z.const('grok')]),
+  apiKeyEnv: z.string().role('credential-ref'),
+  api: apiProtocol,
+  models: z.array(catalogModel),
+})
+
 // Keep these fields optional strings. The settings layer fills absent
 // objects, and a required union here would reject a still-empty tools
 // section (or silently coerce it) before the user picks a model.
@@ -193,17 +284,40 @@ const imageToolModelRef = z.object({
   model: z.string(),
 })
 
-export const Config: z<Config> = z.object({
-  baseURL: z.string(),
+/**
+ * Runtime schema for {@link Config}. Every field is volatile: DSH 0.2 dropped
+ * `settings.installSection`, so the section is declared here and the loader
+ * hands the plugin live references to these fields instead. A volatile node
+ * must not enclose another one, and marking the whole object would hand `apply`
+ * a single opaque cell — so the four fields are marked individually and the
+ * structure stays addressable.
+ *
+ * Volatility is also what makes the section writable: the settings service
+ * refuses any write to a path that does not sit beneath a declared volatile
+ * node.
+ *
+ * Resolved values are live cells, not plain values, so the annotation names
+ * {@link ConfigInput} rather than the pre-volatility `Config` that `apply` used
+ * to receive. tsdown's declaration emit also requires an explicit annotation on
+ * every exported value. The value is asserted to that annotation rather than
+ * checked against it: schemastery resolves a volatile field through
+ * `NoInfer`-wrapped generics whose concrete shape (readonly members, index
+ * signatures, an `| undefined` inside each nested object) is not something a
+ * hand-written interface can equal, while `apply` still consumes exactly
+ * {@link ConfigInput}.
+ */
+export const Config: z<ConfigInput> = z.object({
+  baseURL: z.string().volatile(),
   providers: z.object({
     openai: providerProfile,
     claude: providerProfile,
     grok: providerProfile,
-  }),
+  }).volatile(),
+  endpoints: z.array(providerEndpoint).volatile(),
   tools: z.object({
     generate: imageToolModelRef,
-  }),
-})
+  }).volatile(),
+}) as unknown as z<ConfigInput>
 
 /**
  * Wire protocol the adapter speaks to the gateway for one route. Each value
@@ -274,16 +388,66 @@ function defaultProviders(): Record<ProviderKey, ProviderProfile> {
   return { openai: EMPTY_PROVIDER, claude: EMPTY_PROVIDER, grok: EMPTY_PROVIDER }
 }
 
-export function apply(ctx: Context, config: Config): void {
+/** Validate the host's editable form without attempting a profile write. */
+export async function prepareConfigSave(ctx: Context, next: Config): Promise<() => Promise<void>> {
+  const settings = ctx.get('settings')
+  if (settings === undefined || typeof settings.describe !== 'function' || typeof settings.replace !== 'function') {
+    throw new ConfigSaveError('not-committed')
+  }
+  // Cordis creates a new tracing proxy on each get; provider identity is its original service.
+  const original = Symbol.for('cordis.original')
+  const settingsIdentity = Reflect.get(settings, original) ?? settings
+  const preflight = () => {
+    const entries = settings.describe({ redactSecrets: true }).filter((entry) => entry.ns === NS)
+    if (entries.length !== 1) throw new ConfigSaveError('not-committed')
+    const entry = entries[0]!
+    if (entry.applies !== 'live' || !Number.isSafeInteger(entry.revision) || entry.revision < 0) {
+      throw new ConfigSaveError('not-committed')
+    }
+    if (typeof entry.schema !== 'object' || entry.schema === null || Array.isArray(entry.schema)) {
+      throw new ConfigSaveError('not-committed')
+    }
+    const form = new z(entry.schema)
+    if (form.type !== 'object' || Object.keys(next).some((key) => form.dict?.[key] === undefined)) {
+      throw new ConfigSaveError('not-committed')
+    }
+    form(next)
+    return entry.revision
+  }
+  let revision: number
+  try { revision = preflight() } catch { throw new ConfigSaveError('not-committed') }
+  return async () => {
+    try {
+      const currentSettings = ctx.get('settings')
+      const currentIdentity = currentSettings === undefined ? undefined : Reflect.get(currentSettings, original) ?? currentSettings
+      if (currentIdentity !== settingsIdentity || preflight() !== revision) throw new ConfigSaveError('not-committed')
+    } catch { throw new ConfigSaveError('not-committed') }
+    try {
+      await settings.replace(NS, next, revision)
+    } catch {
+      // replace can reject after its durable write or a failed host compensation.
+      throw new ConfigSaveError('unknown')
+    }
+  }
+}
+
+export function apply(ctx: Context, config: ConfigInput): void {
   // The loader may start this plugin before any `llm-sub2api:` settings exist,
   // so normalize an empty/undefined config into a dormant boot: no baseURL and
-  // no provider profiles yet. The settings scope replaces `current` wholesale
-  // once the harness settings service is available.
-  let current = (): Config => {
-    const raw = config ?? {}
+  // no provider profiles yet. The cells handed in here are live, so this reads
+  // their current value on every call instead of snapshotting once at mount.
+  const current = (): Config => {
+    const raw = {
+      baseURL: readVolatile(config?.baseURL),
+      providers: readVolatile(config?.providers),
+      endpoints: readVolatile(config?.endpoints),
+      tools: readVolatile(config?.tools),
+    }
+    const endpoints = Array.isArray(raw.endpoints) ? raw.endpoints : []
     return {
       baseURL: raw.baseURL ?? '',
       providers: { ...defaultProviders(), ...(raw.providers ?? {}) },
+      ...(endpoints.length > 0 ? { endpoints } : {}),
       ...(raw.tools !== undefined ? { tools: raw.tools } : {}),
     }
   }
@@ -320,7 +484,7 @@ export function apply(ctx: Context, config: Config): void {
 
   // ── pi-ai profile bridge ────────────────────────────────────────────────
   // The chat routes are owned by dsh-llm-pi-ai: every `llm-sub2api:` change
-  // (and boot, via installSection's first onChange) materializes the
+  // (and boot, see the initial sync at the end of apply) materializes the
   // configured groups as `llm-pi-ai:` provider profiles. A refused write
   // (unserviceable profile) keeps the previous routes and is logged here.
   const syncPiAi = () => {
@@ -329,29 +493,23 @@ export function apply(ctx: Context, config: Config): void {
       ctx.logger.error(error)
     })
   }
+  const prepareConfig = async (next: Config) => {
+    const commit = await prepareConfigSave(ctx, next)
+    return async () => {
+      await commit()
+      try { syncPiAi() } catch { throw new ConfigSaveError('committed') }
+    }
+  }
 
   // Settings-page HTTP bridge: read/write config, discover models, query usage.
   // `listRegisteredRoutes` reports the routes the pi-ai adapter actually
   // registered for this plugin's groups.
   registerRoutes(ctx, {
     config: () => current(),
+    prepareConfig,
     setConfig: async (next) => {
-      // The settings snapshot is handed out frozen (immutable), so never mutate
-      // it. Persist through the settings service; its commit swaps the resolved
-      // value and re-notifies (which re-syncs the llm-pi-ai profiles), and we
-      // re-run the sync below so the response reports the routes that just
-      // activated. Without a settings service, fall back to an in-memory source.
-      const settings = ctx.get('settings')
-      if (settings !== undefined) {
-        await settings.replace(NS, next)
-      } else {
-        current = () => ({
-          baseURL: next.baseURL ?? '',
-          providers: { ...defaultProviders(), ...next.providers },
-          ...(next.tools !== undefined ? { tools: next.tools } : {}),
-        })
-      }
-      syncPiAi()
+      const commit = await prepareConfig(next)
+      await commit()
     },
     listRegisteredRoutes: () => ctx.llm.listProviders()
       .map((info) => info.id)
@@ -364,18 +522,36 @@ export function apply(ctx: Context, config: Config): void {
     resolveApiKey,
   })
 
-  ctx.settings.installSection(ctx, NS, Config, config, {
-    setSource: (source) => {
-      current = source
-    },
-    onChange: () => {
-      try {
-        syncPiAi()
-      } catch (error) {
-        ctx.logger.error('llm-sub2api: keeping the previous llm-pi-ai profiles after a refused update')
-        ctx.logger.error(error)
-      }
-    },
+  // DSH 0.2 removed settings.installSection. The section is now declared by
+  // exporting `Config` — the settings service reads the schema off this
+  // plugin's fiber — and declaring it does not by itself subscribe us to
+  // changes: the loader emits `loader/volatile-update` on the context of the
+  // entry whose configuration changed, and only after collecting the volatile
+  // references that plugin's resolved config carries. Reading the cells inside
+  // `current()` during apply is what puts them in that set.
+  //
+  // `auto: false` suppresses the generated settings page: this plugin ships its
+  // own, served over the routes registered above.
+  ctx.effect(() => ctx.settings.configure({ auto: false }))
+
+  ctx.on('loader/volatile-update', () => {
+    try {
+      syncPiAi()
+    } catch (error) {
+      ctx.logger.error('llm-sub2api: keeping the previous llm-pi-ai profiles after a refused update')
+      ctx.logger.error(error)
+    }
+  })
+
+  // Boot sync, deferred out of the mounting turn. Writing another entry's
+  // configuration is a loader-level edit — it re-registers that entry's
+  // providers — and doing it while this plugin is still mounting re-enters the
+  // loader that is currently waiting for us to finish. Before 0.2 this ran from
+  // installSection's first onChange, which the settings service fired only once
+  // the mount had settled.
+  ctx.effect(() => {
+    const timer = setTimeout(() => syncPiAi(), 0)
+    return () => clearTimeout(timer)
   })
 }
 

@@ -1,111 +1,63 @@
-# dsh-sub2api
+# dsh-sub2api: DSH 0.2 Adaptation
 
-[中文文档](./README.zh.md)
+[中文文档](./README.zh.md) | [Changelog](./CHANGELOG.md)
 
-Connect your [sub2api](https://github.com/Wei-Shaw/sub2api) gateway to [DeepSeek Harness](https://github.com/deepseek-ai/dsh) as model providers.
+Connect a [Sub2API](https://github.com/Wei-Shaw/sub2api) gateway to [DeepSeek Harness](https://github.com/deepseek-ai/dsh). This is the **duya07/dsh-sub2api** fork of GodD6366's plugin, based on upstream commit `610ff6f26370a587223cff27449ea894ad87da96`. The package identity remains `@godd6366/dsh-sub2api`, version `0.2.1-dsh02.5`; that name does not identify a new fork release on npm. This delivery is not an npm publication.
 
-Sub2API is an AI API gateway that turns subscription quota into OpenAI-compatible endpoints. In its model, **each API key is bound to a group, and the group decides the platform** (OpenAI / Claude / Grok) and the models that key can serve. The three provider routes (`sub2api-openai`, `sub2api-claude`, `sub2api-grok`) are served by the harness's own pi-ai adapter (`dsh-llm-pi-ai`): this plugin translates its `llm-sub2api:` settings into `llm-pi-ai:` provider profiles (all sharing one **bare-host** base URL, no `/v1`), and protocol serialization, streaming, and usage accounting all live in pi-ai. The same gateway serves OpenAI, Claude, and Grok models side by side, and the harness routes each request to the key whose group owns the requested model.
+## Verified Scope
 
-## Features
+The local adaptation was verified with **DSH 0.2.0-rc.2** and **desktop 2.0.17**. Other versions are not covered by this verification.
 
-- **Image generation**: select a generation model in settings. `generate_image` saves images to the workspace and returns an inline attachment. The separate image-analysis tool and its model selector have been removed.
+- The original adaptation's 136 automated tests and server/client typechecks passed. The release copy adds one packaging test, for 137 passing tests in total.
+- Browser checks covered 192 cases and 2,320 assertions across four viewport sizes.
+- Review was completed. Browser checks used mocked services and are not a production full-chat validation.
 
-- **One base URL, three provider routes**: `sub2api-openai`, `sub2api-claude`, `sub2api-grok` — each configured with its own key and at least one model, registered as a live LLM provider as soon as both are set.
-- **Streaming chat (backed by pi-ai)**: SSE streaming, tool calls, reasoning deltas, and token usage are mapped to the harness protocol by `dsh-llm-pi-ai`, which natively handles wire-format details like top-level `function_call` items in the Responses API.
-- **Model discovery**: one-click "fetch models" calls `GET {baseURL}/v1/models` with the key, so each route's catalog matches exactly what the sub2api group serves.
-- **Reasoning effort (thinking mode)**: `reasoning_effort` is passed straight through to the gateway and adjustable right in the chat model selector; the settings page's per-model "reasoning strength" field fills each model's real levels from [models.dev](https://models.dev/) `reasoning_options` (e.g. `gpt-5.6-sol` → none/low/medium/high/xhigh/max, `deepseek-v4-flash` → low/high/max), editable in the settings page; `reasoningEfforts: []` opts a model out.
-- **Usage lookup**: "view usage" calls `GET {baseURL}/v1/usage` and summarizes quota, balance, rate limits, and subscription windows.
-- **Standards-based config**: base URL and model catalogs live in the `llm-sub2api:` settings section (`$DSH_HOME/settings.yaml`, written by the web Models page); keys go through the harness credential store.
-- **Provider icons** from [lobehub/lobe-icons](https://lobehub.com/icons), embedded as SVG in the settings page.
+Gateway availability, quotas, protocol support and actual reasoning behavior depend on the upstream service. This adaptation does not establish that `upstream_error` is resolved.
 
-## Install
+## Install This Fork
 
-Requires DeepSeek Harness **0.1.2-rc.1 or later**; typecheck, build, and compatibility tests also pass against **0.1.3-alpha.2**. This version uses the settings service’s `installSection` API and the `dsh-client-ui-renderer` browser service; `dsh-client-runtime` is no longer required.
+Use a local tarball built from this repository. Do not install the npm package by name and assume it is this fork. Use a Node version allowed by `package.json`: `^22.19.0 || >=24.0.0`, plus npm, Git and the verified DSH installation.
 
-```bash
-dsh plugin --profile web add @godd6366/dsh-sub2api
-```
-
-or, from this repository:
-
-```bash
-dsh plugin --profile web add .
-```
-
-## Configure
-
-Open **Settings → Sub2API 模型** (or edit `$DSH_HOME/settings.yaml` directly):
-
-```yaml
-llm-sub2api:
-  baseURL: http://localhost:8080
-  providers:
-    openai:
-      apiKeyEnv: SUB2API_OPENAI_API_KEY
-      models:
-        - id: gpt-5.6-sol
-    claude:
-      apiKeyEnv: SUB2API_CLAUDE_API_KEY
-    grok:
-      apiKeyEnv: SUB2API_GROK_API_KEY
-  tools:
-    generate:
-      provider: openai
-      model: gpt-image-1
-```
-
-Store each key through the credentials service (the web Models page writes it, or export `SUB2API_OPENAI_API_KEY=…` etc.). A route activates only when its platform has a key and at least one model; clear the key (or empty the model list) to drop the route again.
-
-### Wire protocol (automatic per group)
-
-The gateway serves each platform group upstream through its NATIVE protocol, and pi-ai picks the endpoint automatically from the key's group — no configuration needed. Configure the **bare host** (no `/v1`): OpenAI-style endpoints get `/v1` appended automatically, and the Anthropic SDK appends `/v1/messages` itself:
-
-| Group | Protocol used | Endpoint |
-|---|---|---|
-| openai | `openai-responses` | `POST {baseURL}/v1/responses` |
-| claude | `anthropic-messages` | `POST {baseURL}/v1/messages` |
-| grok | `openai-completions` | `POST {baseURL}/v1/chat/completions` |
-
-Speaking the native protocol means the gateway never has to convert chat/completions — that conversion is what drops/misaligns tool-call names and ids for parallel calls (`unknown tool ""`, `missing required property …`). To force a different endpoint for a group whose gateway does not serve it natively, declare `api` on the provider in `$DSH_HOME/settings.yaml` (advanced; no settings-page control):
-
-```yaml
-llm-sub2api:
-  baseURL: http://localhost:8080
-  providers:
-    openai:
-      apiKeyEnv: SUB2API_OPENAI_API_KEY
-      api: openai-completions   # optional: openai-completions / openai-responses / anthropic-messages
-      models:
-        - id: gpt-5.6-sol
-```
-
-`api` accepts `openai-completions` (`/v1/chat/completions`), `openai-responses` (`/v1/responses`), or `anthropic-messages` (`/v1/messages`); omitted means the automatic group default above.
-
-### Relationship to dsh-llm-pi-ai
-
-This plugin no longer implements the LLM protocol layer itself: the three `sub2api-*` routes are served by `dsh-llm-pi-ai` (shipped dormant with dsh-base) through `llm-pi-ai:` settings profiles. On every `llm-sub2api:` change (and at boot) the plugin translates the bare-host base URL, per-group models, and key references into hand-declared profiles and writes them to `llm-pi-ai:`, so routes register/drop live. The settings page, model discovery (`GET /v1/models`), usage lookup (`GET /v1/usage`), the image-generation tool remain this plugin's own.
-
-> **Dependency note (pi-ai multi-turn guard)**: pi-ai's `AssistantMessage.usage` is required in its types and its prefix-token estimation dereferences it. The harness path is already safe: `dsh-llm-pi-ai` attaches a zero `Usage` to every reconstructed assistant message. This plugin still applies a defensive guard at boot (`assistant.usage !== undefined` before counting prefix tokens) to `@earendil-works/pi-ai/dist/utils/estimate.js` inside the dsh install, protecting other callers that build pi-ai contexts without `usage`. The patch is idempotent and is re-applied automatically after a dsh upgrade; on a read-only install run `node scripts/patch-pi-ai.mjs` manually.
->
-
-### Image input & reasoning effort
-
-Attaching an image to the session model requires that model to declare the `image` input modality — otherwise the harness refuses before sending ("model does not support images"). **Both fields are editable in model details**: select image input and enter comma-separated reasoning levels, or disable reasoning. models.dev fills missing values without overriding manual choices:
-
-- **Image input**: derived from models.dev `attachment` / `modalities.input` when present (e.g. gpt-5.6-luna → text+image, deepseek-v4-flash → text); otherwise guessed from the model id (`gpt-*`, `claude-*`, `gemini-*`, `grok-*`, `glm-*`, … default to text+image). Pin a model to text-only with `input: [text]` in `$DSH_HOME/settings.yaml`.
-- **Reasoning effort**: derived from models.dev `reasoning_options` when present (e.g. deepseek-v4-flash → high/max); otherwise the default low/medium/high, and models with `reasoning: false` are marked unsupported.
-
-When the model accepts images, the request carries the image in the group's native protocol: openai → Responses `input_image`, claude → Messages `image` (base64), grok → chat-completions `image_url`.
-
-
-## Development
-
-```bash
-npm install
-npm run build     # tsdown → lib/ + client wrapper
+```sh
+git clone https://github.com/duya07/dsh-sub2api.git
+cd dsh-sub2api
+npm ci --ignore-scripts
 npm run typecheck
+npm test
+npm pack --ignore-scripts
+dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.5.tgz
 ```
 
-## License
+`npm test` runs the build before the tests, so the tarball includes freshly built `lib` assets even though lifecycle scripts are disabled during install and packing. The tarball name above follows the current package name and version; use the actual filename printed by `npm pack` if they change. Restart DSH/desktop after adding the plugin. If your active profile is not `desktop`, replace `desktop` with your own profile name.
 
-MIT
+The package declares `dsh.bundle.patch: ./cordis.patch.yml`. That bundled patch inserts the `llm-sub2api` entry using the existing package name. Normal chat profiles are translated into the host's `llm-pi-ai` adapter; this plugin does not replace its streaming or tool-call implementation and does not change the default agent model.
+
+## Configure In The UI
+
+Open DSH Settings and select **Sub2API**. Add endpoint rows, choose a platform and protocol, enter each endpoint's key, obtain or add its models, and save. Then select the desired route/model in DSH. Endpoint and model details can be folded to keep a large catalog manageable.
+
+Each endpoint has its own name, base URL, credential reference, protocol and model catalog. Multiple independent gateways or multiple keys on the same platform are supported. Sub2API keys belong to gateway groups, so discovery reflects the catalog returned for that key, not proof that every model or feature is operational.
+
+Enter a bare gateway host, such as `http://localhost:8080` or `https://gateway.example.test`, without `/v1`. Choose the protocol the gateway actually serves: `openai-responses`, `openai-completions` or `anthropic-messages`. An endpoint with an empty base URL inherits the shared URL. A nonempty `endpoints` list is the sole source of chat profiles; the legacy shared URL and `providers` configuration remain supported when that list is absent or empty.
+
+DSH 0.2 persists configuration through the selected profile's **`cordis.patch.yml`**, not `settings.yaml`. Prefer the UI rather than editing a real profile manually. The adapter uses `settings.configure({ auto: false })`, volatile schema fields and deferred initial profile synchronization for the DSH 0.2 loader contract.
+
+Keys are written to the DSH credential store; configuration retains references, not key values, and read-back never returns secrets. A fictional reference such as `EXAMPLE_SUB2API_KEY_REF` is a reference name, not a credential value. Credential writes are compensated only when settings persistence explicitly reports `not-committed`. A committed or unknown outcome, including a non-200 response with an uncertain commit state, retains the key to avoid breaking configuration that may already have been saved.
+
+## Reasoning Probes
+
+Automatic probing is **off by default**. A per-model button starts a manual single-model probe. Enable an endpoint's automatic option before explicitly using **Discover / 获取模型** or **Fill / 补全数据** to enqueue its models. All eligible models are queued, not just the first model; opening settings alone does not start that automatic batch.
+
+Probes share a server-wide scheduler with at least **five seconds from one request ending to the next starting**. They send real, potentially billable requests. Queued and running probes can be cancelled. Rate limits can extend the wait.
+
+Results distinguish `accepted`, `unsupported` and `unknown`. A level is excluded from the suggestion only after two exact, explicit parameter rejections with a successful no-effort control. Timeouts, authentication/quota problems, upstream failures, ambiguous responses and parameter transformations remain `unknown` and are retained conservatively. `accepted` means the parameter was accepted, **not proof that the model actually reasoned**.
+
+Suggestions may populate new, unedited rows that have not disabled reasoning. Saved rows, manual reasoning edits and explicit `off` are not automatically overwritten: use **Apply suggestion / 应用建议**, then save, to accept a change. Public metadata is a starting point, not evidence of gateway support.
+
+## Usage And Images
+
+Usage lookup queries the selected endpoint's `/v1/usage` when supported. Image generation uses a separately selected generation model, saves the result to the workspace and can return an inline attachment. It supports endpoint routes and legacy provider references. Generation does not require the current chat model to generate images; actual image/protocol support remains gateway-dependent.
+
+## License And Attribution
+
+[MIT](./LICENSE). The upstream copyright notice, **Copyright (c) 2026 GodD6366**, is retained. DSH 0.2 adaptation and fork maintenance are in [duya07/dsh-sub2api](https://github.com/duya07/dsh-sub2api); upstream provenance is the commit noted above. See the changelog for this adaptation's scope.

@@ -1,8 +1,7 @@
-# Sub2API routes for the harness LLM seam.
-# One base URL, per-key provider routes. Keys are configured through the
-# `llm-sub2api:` settings section (the web Models page writes it, or edit
-# $DSH_HOME/settings.yaml directly); the adapter registers a route per
-# configured key and drops dormant routes when a key is cleared.
+# Sub2API endpoint profiles for DSH 0.2.
+# Configure independent gateways and credential references in the Sub2API UI.
+# DSH persists settings in the selected profile's cordis.patch.yml.
+# The host pi-ai adapter handles normal chat protocols.
 #
 # Does not override agent-default-model.
 

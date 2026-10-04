@@ -1,0 +1,226 @@
+/**
+ * Sub2API gateway integration for the harness LLM seam.
+ *
+ * One OpenAI-compatible base URL, many provider routes. In the sub2api
+ * gateway each API key is bound to a group, and the group decides the
+ * platform (openai / anthropic / grok) and the model list the key
+ * can serve.
+ *
+ * The LLM routes this plugin used to own (`sub2api-openai` / `sub2api-claude`
+ * / `sub2api-grok`) are served by the harness's own pi-ai
+ * adapter (`dsh-llm-pi-ai`, mounted dormant by dsh-base): protocol
+ * serialization, streaming, usage mapping, replay, and retry handling all live
+ * in pi-ai, which speaks each platform's native wire protocol upstream (OpenAI
+ * → Responses API, Claude → Messages API, the rest → chat/completions).
+ * This plugin contributes the sub2api-specific surface on top: the
+ * `llm-sub2api:` settings section and its web page (baseURL + per-key model
+ * catalogs + keys), gateway model discovery and usage probes, the global
+ * image-generation tools, and a bridge
+ * that materializes the configured groups as `llm-pi-ai:` provider profiles
+ * the moment the section lands (see `./pi-ai.ts`).
+ *
+ * Keys are stored through the harness credential seam; the base URL and
+ * per-key model catalogs live in the `llm-sub2api:` settings section
+ * (persisted by the harness into the active profile, written by the web Models
+ * page).
+ *
+ * @module dsh-sub2api
+ */
+import type { Context } from '@deepseek-ai/cordis';
+import z from '@deepseek-ai/schemastery';
+export { PI_AI_NS, ROUTE_PREFIX, syncPiAiProfiles, translateToPiAi, type PiAiModelProfile, type PiAiProviderProfile, type PiAiSettingsSection, } from './pi-a./pi-ai.jsort { applyPiAiMultiTurnPatch, type PiAiPatchResult } from './pi-a./pi-ai-patch.jsort declare const name = "llm-sub2api";
+export declare const inject: string[];
+/** Context capacity assumed for a model neither configuration nor discovery sizes. */
+export declare const DEFAULT_CONTEXT_WINDOW = 128000;
+/** Output capability assumed for a model neither configuration nor discovery sizes. */
+export declare const DEFAULT_MAX_TOKENS = 8192;
+/**
+ * Reasoning effort levels exposed for reasoning-capable models. The gateway
+ * speaks the OpenAI chat-completions protocol, so the ids are the OpenAI
+ * `reasoning_effort` vocabulary and are sent through verbatim. Per-model
+ * configuration (filled from models.dev `reasoning_options`) may expose
+ * additional vocabulary such as `none`, `xhigh`, or `max`.
+ */
+export declare const REASONING_EFFORTS: readonly {
+    id: string;
+    name: string;
+}[];
+export type ProviderKey = 'openai' | 'claude' | 'grok';
+export interface ProviderDef {
+    key: ProviderKey;
+    route: string;
+    label: string;
+    icon: string;
+}
+/** The provider routes this plugin owns, keyed by sub2api platform name. */
+export declare const PROVIDERS: readonly ProviderDef[];
+export interface CatalogModel {
+    /** Model id sent to the provider and accepted by {@link GenerateOptions.model}. */
+    id: string;
+    /** Display name for selectors; defaults to the id. */
+    name?: string;
+    /** Maximum combined request and response context in tokens. */
+    contextWindow?: number;
+    /** Maximum output tokens. */
+    maxTokens?: number;
+    /**
+     * Accepted request modalities. Absent or empty: the adapter guesses from
+     * the model id (multimodal families such as gpt/claude/gemini/grok/glm
+     * declare `[text, image]`, everything else stays `[text]`). Non-empty:
+     * exactly those modalities, e.g. `[text]` to pin a multimodal-looking
+     * model to text only.
+     */
+    input?: Array<'text' | 'image'>;
+    /**
+     * Reasoning effort levels selectable for this model. Absent: every non-image
+     * model on any route exposes low/medium/high (the gateway is OpenAI-compatible
+     * on all routes). Empty array: reasoning effort is explicitly off for this
+     * model. Non-empty: exposes exactly those levels verbatim (e.g. models.dev
+     * vocabularies such as `xhigh`/`max`/`none`).
+     */
+    reasoningEfforts?: string[];
+}
+export interface ProviderProfile {
+    /** Credential reference (environment-variable name) resolved per request through `ctx.credentials`. */
+    apiKeyEnv?: string;
+    /**
+     * Wire protocol spoken to the gateway for this platform group. Absent
+     * selects the group's native protocol (openai → responses, claude →
+     * messages, grok → chat/completions). Explicitly name a protocol to
+     * force a different endpoint, e.g. a gateway that serves a group through
+     * chat/completions after all.
+     */
+    api?: ApiProtocol;
+    /** Advisory model catalog for this route. */
+    models?: CatalogModel[];
+}
+/**
+ * One independently-keyed sub2api endpoint.
+ *
+ * The shipped layout is one fixed slot per platform, which caps a user at a
+ * single gateway per platform: a second gateway — or a second group key on the
+ * same gateway — has nowhere to go. An endpoint list removes that cap. Every
+ * entry carries its own host and its own key; `platform` only decides which
+ * native wire protocol the entry speaks, because the gateway still serves
+ * openai groups through the Responses API and claude groups through Messages.
+ */
+export interface ProviderEndpoint {
+    /** Optional label; names the route and titles the settings-page row. */
+    name?: string;
+    /** This entry's own gateway host. Absent falls back to the section `baseURL`. */
+    baseURL?: string;
+    /** Sub2api platform group this key belongs to; decides the native protocol. */
+    platform: ProviderKey;
+    /** Credential reference holding this entry's key. */
+    apiKeyEnv?: string;
+    /** Wire-protocol override for this entry. */
+    api?: ApiProtocol;
+    /** Advisory model catalog for this entry. */
+    models?: CatalogModel[];
+}
+/** One dedicated model used by a global image tool, independent of the chat route. */
+export interface ImageToolModelRef {
+    /** Sub2API platform that owns the key and catalog (`openai` / `claude` / `grok`). */
+    provider: string;
+    /** Model id sent to the gateway. */
+    model: string;
+}
+export interface ImageToolsConfig {
+    /** Image-generation model used by the global `generate_image` tool. */
+    generate?: ImageToolModelRef;
+}
+export interface Config {
+    /** OpenAI-compatible gateway base URL, e.g. http://localhost:8080/v1. */
+    baseURL: string;
+    /** Per-platform provider profiles keyed by sub2api platform name. */
+    providers: Record<ProviderKey, ProviderProfile>;
+    /**
+     * Independently-keyed endpoints. A non-empty list is the sole source of chat
+     * routes; {@link providers} then stays untouched as the legacy shape, so a
+     * section written by an older build keeps working. Absent or empty keeps the
+     * original one-slot-per-platform behaviour.
+     */
+    endpoints?: ProviderEndpoint[];
+    /** Dedicated models for the global image-generation tools. */
+    tools?: ImageToolsConfig;
+}
+/**
+ * A live configuration cell. DSH 0.2's loader hands each `volatile()` schema
+ * field to `apply` as one of these frozen references instead of a plain value:
+ * it keeps the object identity and re-points the value in place when the
+ * configuration changes, then emits `loader/volatile-update` on this plugin's
+ * own context. Reading `.get()` is also what subscribes the plugin to that
+ * event — the loader only notifies plugins whose resolved config carries the
+ * references it collected.
+ */
+export interface Volatile<T> {
+    get(): T;
+}
+/**
+ * The configuration `apply` receives. Every field declared volatile in
+ * {@link Config} arrives as a {@link Volatile} cell; fields are optional
+ * because a section that never stored a value still resolves — an unset
+ * `baseURL` is a live cell holding `undefined`.
+ */
+export interface ConfigInput {
+    baseURL?: Volatile<string | undefined>;
+    providers?: Volatile<Record<ProviderKey, ProviderProfile>>;
+    endpoints?: Volatile<ProviderEndpoint[]>;
+    tools?: Volatile<ImageToolsConfig>;
+}
+/**
+ * Read one configuration cell. The loader always supplies a volatile
+ * reference for a volatile schema field, but test fixtures call `apply` with
+ * plain literals, so both shapes are accepted.
+ */
+export declare function readVolatile<T>(value: Volatile<T> | T | undefined): T | undefined;
+/**
+ * Runtime schema for {@link Config}. Every field is volatile: DSH 0.2 dropped
+ * `settings.installSection`, so the section is declared here and the loader
+ * hands the plugin live references to these fields instead. A volatile node
+ * must not enclose another one, and marking the whole object would hand `apply`
+ * a single opaque cell — so the four fields are marked individually and the
+ * structure stays addressable.
+ *
+ * Volatility is also what makes the section writable: the settings service
+ * refuses any write to a path that does not sit beneath a declared volatile
+ * node.
+ *
+ * Resolved values are live cells, not plain values, so the annotation names
+ * {@link ConfigInput} rather than the pre-volatility `Config` that `apply` used
+ * to receive. tsdown's declaration emit also requires an explicit annotation on
+ * every exported value. The value is asserted to that annotation rather than
+ * checked against it: schemastery resolves a volatile field through
+ * `NoInfer`-wrapped generics whose concrete shape (readonly members, index
+ * signatures, an `| undefined` inside each nested object) is not something a
+ * hand-written interface can equal, while `apply` still consumes exactly
+ * {@link ConfigInput}.
+ */
+export declare const Config: z<ConfigInput>;
+/**
+ * Wire protocol the adapter speaks to the gateway for one route. Each value
+ * names a real endpoint: `openai-completions` → `/chat/completions`,
+ * `openai-responses` → `/responses`, `anthropic-messages` → `/messages`.
+ */
+export type ApiProtocol = 'openai-completions' | 'openai-responses' | 'anthropic-messages';
+export declare const API_PROTOCOLS: readonly ApiProtocol[];
+/** Resolve the wire protocol for one provider key; shared by chat routes and the global image tools. */
+export declare function apiProtocolForKey(key: ProviderKey, profile: ProviderProfile): ApiProtocol;
+/**
+ * The OpenAI-style API root for a gateway base URL. The Sub2API settings page
+ * stores the bare host (e.g. `https://gateway.example:6443`); OpenAI-compatible
+ * endpoints (`/responses`, `/chat/completions`, `/models`, `/usage`) live under
+ * the `/v1` root, so it is appended here when missing. A URL already carrying
+ * `/v1` passes through unchanged.
+ */
+export declare function gatewayApiRoot(baseURL: string): string;
+/**
+ * The bare-host form the Anthropic SDK expects: `@anthropic-ai/sdk` treats the
+ * configured URL as the host and always appends `/v1/messages` itself, so a
+ * `/v1`-rooted URL would hit `/v1/v1/messages` (404). Strips a trailing `/v1`
+ * when present.
+ */
+export declare function gatewayAnthropicRoot(baseURL: string): string;
+/** Validate the host's editable form without attempting a profile write. */
+export declare function prepareConfigSave(ctx: Context, next: Config): Promise<() => Promise<void>>;
+export declare function apply(ctx: Context, config: ConfigInput): void;

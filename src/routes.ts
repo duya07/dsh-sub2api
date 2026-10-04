@@ -17,7 +17,10 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { API_PROTOCOLS, PROVIDERS, gatewayApiRoot, type ApiProtocol, type CatalogModel, type Config, type ImageToolModelRef, type ImageToolsConfig, type ProviderKey, type ProviderProfile } from './index.ts'
+import { assertUsableApiKey } from '@deepseek-ai/dsh-llm'
+import { API_PROTOCOLS, PROVIDERS, gatewayApiRoot, type ApiProtocol, type CatalogModel, type Config, type ImageToolModelRef, type ImageToolsConfig, type ProviderEndpoint, type ProviderKey, type ProviderProfile } from './index.ts'
+import { endpointRoute, platformLabel } from './pi-ai.ts'
+import { ReasoningProbeService, parseProbeDraft } from './reasoning-probe.ts'
 
 export const ROUTES = {
   get: '/plugins/dsh-sub2api/config',
@@ -26,12 +29,30 @@ export const ROUTES = {
   usage: '/plugins/dsh-sub2api/usage',
   status: '/plugins/dsh-sub2api/status',
   attachment: '/plugins/dsh-sub2api/attachment',
+  reasoningStart: '/plugins/dsh-sub2api/reasoning/start',
+  reasoningStatus: '/plugins/dsh-sub2api/reasoning/status',
+  reasoningCancel: '/plugins/dsh-sub2api/reasoning/cancel',
 } as const
+
+/** One endpoint as the settings page sees it. Secrets are never echoed. */
+export interface ConfigPayloadEndpoint {
+  name: string
+  baseURL: string
+  platform: ProviderKey
+  /** Credential reference the page echoes back so a rename keeps its key. */
+  apiKeyEnv?: string
+  keyConfigured: boolean
+  api?: ApiProtocol
+  models: CatalogModel[]
+  /** Route id this endpoint currently resolves to. */
+  route: string
+}
 
 export interface ConfigPayload {
   baseURL: string
   catalogFormat: 'structured-v1'
   providers: Record<string, { keyConfigured: boolean; models: CatalogModel[] }>
+  endpoints: ConfigPayloadEndpoint[]
   tools: ImageToolsConfig
 }
 
@@ -89,10 +110,22 @@ function readProviderConfig(config: Config): ConfigPayload {
       models: profile.models?.map((model) => ({ ...model })) ?? [],
     }
   }
+  const list = config.endpoints ?? []
+  const endpoints: ConfigPayloadEndpoint[] = list.map((endpoint) => ({
+    name: endpoint.name ?? '',
+    baseURL: endpoint.baseURL ?? '',
+    platform: endpoint.platform,
+    ...(endpoint.apiKeyEnv !== undefined ? { apiKeyEnv: endpoint.apiKeyEnv } : {}),
+    keyConfigured: endpoint.apiKeyEnv !== undefined,
+    ...(endpoint.api !== undefined ? { api: endpoint.api } : {}),
+    models: endpoint.models?.map((model) => ({ ...model })) ?? [],
+    route: endpointRoute(endpoint, list),
+  }))
   return {
     baseURL: config.baseURL,
     catalogFormat: 'structured-v1',
     providers,
+    endpoints,
     tools: {
       ...(config.tools?.generate !== undefined ? { generate: { ...config.tools.generate } } : {}),
     },
@@ -156,6 +189,32 @@ function providerCredentialRef(platform: string): CredentialRef {
   return credentialRef(`SUB2API_${platform.toUpperCase()}_API_KEY`)
 }
 
+/**
+ * Credential reference for one endpoint.
+ *
+ * The first endpoint on a platform keeps the historical
+ * `SUB2API_<PLATFORM>_API_KEY` name, so a key stored before this feature
+ * existed survives as the platform's sole endpoint. Later ones append a slug.
+ * The reference is generated once: the page echoes the stored `apiKeyEnv`
+ * back, so renaming an endpoint never orphans its key.
+ */
+export function endpointCredentialRef(platform: ProviderKey, name: string, siblings: readonly ProviderEndpoint[]): string {
+  const upper = platform.toUpperCase()
+  const stub = `SUB2API_${upper}_API_KEY`
+  if (siblings.length === 0) return stub
+  const slug = name
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  const taken = new Set(siblings.map((entry) => entry.apiKeyEnv).filter((ref) => ref !== undefined))
+  const candidate = slug.length > 0 ? `SUB2API_${upper}_${slug}_API_KEY` : `${stub}_${siblings.length + 1}`
+  let ref = candidate
+  let suffix = siblings.length + 1
+  while (taken.has(ref)) ref = `${candidate}_${suffix++}`
+  return ref
+}
+
 function isProviderKey(value: string): value is ProviderKey {
   return PROVIDERS.some((def) => def.key === value)
 }
@@ -182,6 +241,8 @@ function readImageTools(value: unknown, fallback: ImageToolsConfig | undefined):
 interface RouteContext {
   config: () => Config
   setConfig: (config: Config) => void | Promise<void>
+  /** Preflight without mutation; the returned closure owns the settings commit. */
+  prepareConfig?: (config: Config) => (() => void | Promise<void>) | Promise<() => void | Promise<void>>
   listRegisteredRoutes: () => string[]
   /**
    * Resolve the stored credential for one provider route. Used by discovery
@@ -189,6 +250,34 @@ interface RouteContext {
    * key (keys are write-only and stay in the credential store).
    */
   resolveApiKey: (route: string, profile: ProviderProfile) => Promise<string>
+}
+
+export type SettingsSaveOutcome = 'not-committed' | 'committed' | 'unknown'
+
+/** An explicit attestation; a generic settings rejection is not a rollback receipt. */
+export class ConfigSaveError extends Error {
+  readonly outcome: SettingsSaveOutcome
+
+  constructor(outcome: SettingsSaveOutcome) {
+    super('settings save failed')
+    this.outcome = outcome
+  }
+}
+
+function validConfigRef(value: unknown): value is CredentialRef {
+  return typeof value === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value)
+}
+
+function validConfigURL(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return /^https?:\/\//.test(value) && (url.protocol === 'https:' || url.protocol === 'http:') && url.hostname.length > 0
+  } catch { return false }
+}
+
+function validSavedProfile(profile: ProviderProfile): boolean {
+  return (profile.apiKeyEnv === undefined || validConfigRef(profile.apiKeyEnv))
+    && (profile.api === undefined || (API_PROTOCOLS as readonly string[]).includes(profile.api))
 }
 
 /**
@@ -202,8 +291,19 @@ async function resolveProbeKey(
   routes: RouteContext,
   provider: string,
   typedKey: string,
+  storedRef?: string,
 ): Promise<string> {
   if (typedKey.length > 0) return typedKey
+  // Endpoint rows hand back their own credential reference, so a gateway
+  // holding several keys probes the key on that row instead of whichever one
+  // the platform happens to store first.
+  if (typeof storedRef === 'string' && storedRef.length > 0) {
+    try {
+      return await routes.resolveApiKey(storedRef, { apiKeyEnv: storedRef })
+    } catch (error) {
+      throw new Error(`无法使用该端点已保存的 key（${storedRef}）：${safeMessage(error)}`)
+    }
+  }
   if (!isProviderKey(provider)) throw new Error('provider 无效，应为 openai / claude / grok')
   const def = PROVIDERS.find((entry) => entry.key === provider)
   const profile = routes.config().providers[provider]
@@ -218,9 +318,40 @@ async function resolveProbeKey(
 }
 
 export function registerRoutes(ctx: Context, routes: RouteContext): void {
+  let configSaveTail: Promise<void> = Promise.resolve()
   ctx.inject(['webServer'], (webCtx) => {
+    const probes = new ReasoningProbeService()
+    webCtx.effect(() => () => probes.dispose())
     const register = (path: string, handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>) => {
       webCtx.webServer.register({ kind: 'exact', path, handler })
+    }
+
+    for (const [path, action] of [[ROUTES.reasoningStart, 'start'], [ROUTES.reasoningStatus, 'status'], [ROUTES.reasoningCancel, 'cancel']] as const) {
+      register(path, async (req, res) => {
+        if (req.method !== 'POST') return json(res, 405, {error: 'method not allowed'})
+        if (!trustedRequest(req)) return json(res, 403, {error: 'forbidden'})
+        try {
+          const chunks: Buffer[] = []
+          let size = 0
+          for await (const chunk of req) {
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+            size += buffer.length
+            if (size > 32768) return json(res, 413, {error: 'probe request too large'})
+            chunks.push(buffer)
+          }
+          const body: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+          if (action === 'start') {
+            const draft = parseProbeDraft(body)
+            if (!draft) return json(res, 400, {error: 'invalid probe draft'})
+            const key = await resolveProbeKey(ctx, routes, draft.endpoint.platform, draft.endpoint.apiKey, draft.endpoint.apiKeyEnv)
+            const task = probes.start(draft, key)
+            return task ? json(res, 202, task) : json(res, 429, {error: 'probe task limit'})
+          }
+          const id = body !== null && typeof body === 'object' && 'id' in body && typeof body.id === 'string' ? body.id : ''
+          const task = action === 'cancel' ? probes.cancel(id) : probes.status(id)
+          return task ? json(res, 200, task) : json(res, 404, {error: 'probe task not found'})
+        } catch {return json(res, 400, {error: 'probe request unavailable'})}
+      })
     }
 
     // GET/POST config share one pathname. The webserver routes by path only and
@@ -238,9 +369,19 @@ export function registerRoutes(ctx: Context, routes: RouteContext): void {
       // POST config: persist baseURL + per-platform models; keys go to credentials.
       try {
         const body = await readJson(req)
+        const save = configSaveTail.then(async () => {
+        const credentials = ctx.get('credentials')
+        const snapshots = new Map<CredentialRef, string | undefined>()
+        const attempted: CredentialRef[] = []
+        let settingsOutcome: SettingsSaveOutcome = 'not-committed'
+        try {
         const baseURL = typeof body.baseURL === 'string' ? body.baseURL.trim().replace(/\/+$/, '') : ''
-        if (baseURL.length === 0) return json(res, 400, { error: 'baseURL is required' })
-        if (!/^https?:\/\//.test(baseURL)) return json(res, 400, { error: 'baseURL must start with http(s)://' })
+        const rawEndpoints = Array.isArray(body.endpoints) ? body.endpoints : undefined
+        const hasEndpoints = rawEndpoints !== undefined && rawEndpoints.length > 0
+        // Endpoints carry their own host, so the section-level URL is only
+        // required by the legacy one-slot-per-platform shape.
+        if (!hasEndpoints && baseURL.length === 0) return json(res, 400, { error: 'baseURL is required' })
+        if (baseURL.length > 0 && !validConfigURL(baseURL)) return json(res, 400, { error: 'invalid baseURL' })
 
         // Build a fresh config instead of mutating: the settings snapshot is
         // frozen (handed out immutably by the settings service).
@@ -252,23 +393,33 @@ export function registerRoutes(ctx: Context, routes: RouteContext): void {
             claude: { ...current.providers.claude },
             grok: { ...current.providers.grok },
           },
+          // Keep whatever the section already holds: a request carrying no
+          // `endpoints` key (an older page) must not silently drop them.
+          ...(current.endpoints !== undefined ? { endpoints: current.endpoints } : {}),
           ...(current.tools !== undefined ? { tools: { ...current.tools } } : {}),
         }
 
         const rawProviders = typeof body.providers === 'object' && body.providers !== null
           ? body.providers as Record<string, unknown>
           : {}
-        const credentials = ctx.get('credentials')
+        const writes = new Map<CredentialRef, string>()
+        const addKey = (ref: string, apiKey: string): boolean => {
+          if (!validConfigRef(ref)) return false
+          let value: string
+          try { value = assertUsableApiKey(apiKey, 'llm-sub2api', ref) } catch { return false }
+          if (writes.has(ref) && writes.get(ref) !== value) return false
+          writes.set(ref, value)
+          return true
+        }
 
         for (const def of PROVIDERS) {
           const raw = rawProviders[def.key] as Record<string, unknown> | undefined
           const profile = next.providers[def.key]
           const apiKey = typeof raw?.apiKey === 'string' ? raw.apiKey.trim() : ''
-          if (apiKey.length > 0 && credentials !== undefined) {
-            await credentials.set(providerCredentialRef(def.key), apiKey)
-            profile.apiKeyEnv = providerCredentialRef(def.key)
-          } else if (apiKey.length > 0 && credentials === undefined) {
-            profile.apiKeyEnv = providerCredentialRef(def.key)
+          if (apiKey.length > 0) {
+            const ref = profile.apiKeyEnv ?? providerCredentialRef(def.key)
+            if (!addKey(ref, apiKey)) return json(res, 400, { error: 'invalid Key or conflicting credential reference' })
+            profile.apiKeyEnv = ref
           }
           // Wire protocol: empty string clears an explicit override (the
           // group's native protocol applies); a valid name sets one.
@@ -279,20 +430,139 @@ export function registerRoutes(ctx: Context, routes: RouteContext): void {
             } else if ((API_PROTOCOLS as readonly string[]).includes(api)) {
               profile.api = api as ApiProtocol
             } else {
-              return json(res, 400, { error: `${def.label} 的网关协议 "${api}" 无效，应为 ${API_PROTOCOLS.join(' / ')}` })
+              return json(res, 400, { error: 'invalid provider protocol' })
             }
           }
           profile.models = readCatalogModels(raw?.models, profile.models ?? [])
+        }
+
+        // Reserve retained and explicit refs before allocating any new endpoint ref.
+        const reserved: ProviderEndpoint[] = [
+          ...(current.endpoints ?? []),
+          ...PROVIDERS.flatMap((def) => {
+            const ref = next.providers[def.key].apiKeyEnv
+            return ref === undefined ? [] : [{ platform: def.key, apiKeyEnv: ref }]
+          }),
+          ...(rawEndpoints ?? []).flatMap((entry) => {
+            if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return []
+            const ref = (entry as Record<string, unknown>).apiKeyEnv
+            return typeof ref === 'string' && ref.trim().length > 0 ? [{ platform: 'openai' as const, apiKeyEnv: ref.trim() }] : []
+          }),
+        ]
+        if (rawEndpoints !== undefined) {
+          const parsed: ProviderEndpoint[] = []
+          for (const entry of rawEndpoints) {
+            if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return json(res, 400, { error: 'invalid endpoint' })
+            const raw = entry as Record<string, unknown>
+            const platform = typeof raw.platform === 'string' && isProviderKey(raw.platform) ? raw.platform : undefined
+            const name = typeof raw.name === 'string' ? raw.name.trim() : ''
+            if (platform === undefined) {
+              return json(res, 400, { error: 'invalid endpoint platform' })
+            }
+            const host = typeof raw.baseURL === 'string' ? raw.baseURL.trim().replace(/\/+$/, '') : ''
+            if (!validConfigURL(host || baseURL)) {
+              return json(res, 400, { error: 'invalid endpoint URL' })
+            }
+            // Wire protocol: empty string clears an explicit override (the
+            // platform's native protocol applies); a valid name sets one.
+            let api: ApiProtocol | undefined
+            const rawApi = typeof raw.api === 'string' ? raw.api.trim() : undefined
+            if (rawApi !== undefined) {
+              if ((API_PROTOCOLS as readonly string[]).includes(rawApi)) api = rawApi as ApiProtocol
+              else if (rawApi.length > 0) {
+                return json(res, 400, { error: 'invalid endpoint protocol' })
+              }
+            }
+            // A stored `apiKeyEnv` is echoed back by the page: keeping it means
+            // renaming an endpoint does not orphan the key already saved under
+            // the old reference.
+            const apiKey = typeof raw.apiKey === 'string' ? raw.apiKey.trim() : ''
+            let apiKeyEnv = typeof raw.apiKeyEnv === 'string' ? raw.apiKeyEnv.trim() : ''
+            if (apiKey.length > 0) {
+              if (apiKeyEnv.length === 0) apiKeyEnv = endpointCredentialRef(platform, name, [...reserved, ...parsed])
+              if (!addKey(apiKeyEnv, apiKey)) return json(res, 400, { error: 'invalid Key or conflicting credential reference' })
+            }
+            // Rows arrive in page order, so the previous entry at this index
+            // supplies the catalog when the request omits one.
+            const previous = current.endpoints?.[parsed.length]
+            parsed.push({
+              ...(name.length > 0 ? { name } : {}),
+              ...(host.length > 0 ? { baseURL: host } : {}),
+              platform,
+              ...(apiKeyEnv.length > 0 ? { apiKeyEnv } : {}),
+              ...(api !== undefined ? { api } : {}),
+              models: readCatalogModels(raw.models, previous?.models ?? []),
+            })
+          }
+          next.endpoints = parsed
         }
 
         const tools = readImageTools(body.tools, current.tools)
         if (tools !== undefined) next.tools = tools
         else delete next.tools
 
-        await routes.setConfig(next)
+        if (!PROVIDERS.every((def) => validSavedProfile(next.providers[def.key]))) {
+          return json(res, 400, { error: 'invalid retained provider configuration' })
+        }
+        for (const entry of next.endpoints ?? []) {
+          if (!isProviderKey(entry.platform) || !validSavedProfile(entry) || !validConfigURL(entry.baseURL || baseURL)) {
+            return json(res, 400, { error: 'invalid retained endpoint configuration' })
+          }
+        }
+        const commit = routes.prepareConfig === undefined ? () => routes.setConfig(next) : await routes.prepareConfig(next)
+        if (writes.size > 0) {
+          if (credentials === undefined || ['describe', 'resolve', 'set', 'unset'].some((method) => typeof Reflect.get(credentials, method) !== 'function')) {
+            return json(res, 503, { error: 'credential save service unavailable' })
+          }
+          for (const ref of writes.keys()) {
+            const state = await credentials.describe(ref)
+            const hit = await credentials.resolve(ref)
+            if (state.writable !== true || state.source === 'env' || hit?.source === 'env') {
+              return json(res, 400, { error: 'credential reference is not writable' })
+            }
+            if (typeof state.configured !== 'boolean' || state.configured !== (hit !== undefined)
+              || state.source !== hit?.source || (hit !== undefined && (typeof hit.value !== 'string' || hit.value.length === 0))) {
+              throw new ConfigSaveError('not-committed')
+            }
+            snapshots.set(ref, hit?.source === 'file' ? hit.value : undefined)
+          }
+          for (const [ref, value] of writes) {
+            // Host notifications can throw after the credential was durably written.
+            attempted.push(ref)
+            await credentials.set(ref, value)
+          }
+        }
+        settingsOutcome = 'unknown'
+        await commit()
+        settingsOutcome = 'committed'
         json(res, 200, { ok: true, ...readProviderConfig(next), routes: routes.listRegisteredRoutes() })
       } catch (error) {
-        json(res, 500, { error: safeMessage(error) })
+        if (settingsOutcome !== 'committed' && error instanceof ConfigSaveError) settingsOutcome = error.outcome
+        let credentialOutcome = attempted.length === 0 ? 'unchanged' : 'preserved'
+        if (settingsOutcome === 'not-committed' && attempted.length > 0) {
+          credentialOutcome = 'restored'
+          for (const ref of attempted.reverse()) {
+            try {
+              const value = snapshots.get(ref)
+              if (value === undefined) await credentials!.unset(ref)
+              else await credentials!.set(ref, value)
+            } catch { credentialOutcome = 'restore-incomplete' }
+          }
+        }
+        const message = settingsOutcome === 'unknown'
+          ? '保存结果无法确认，Key 可能已写入且未回滚；请重新加载配置后再重试。'
+          : settingsOutcome === 'committed'
+            ? '配置已提交，但保存结果未能完整返回；Key 已保留，请重新加载确认。'
+            : credentialOutcome === 'restore-incomplete'
+              ? '配置未提交，但部分 Key 未能恢复；请重新加载并检查后再重试。'
+              : '配置未提交，Key 已恢复或未写入；请检查配置后再重试。'
+        json(res, 500, { error: message, settingsOutcome, credentialOutcome })
+      }
+        })
+        configSaveTail = save.then(() => undefined, () => undefined)
+        await save
+      } catch {
+        json(res, 500, { error: 'configuration save unavailable' })
       }
     })
 
@@ -308,7 +578,7 @@ export function registerRoutes(ctx: Context, routes: RouteContext): void {
         if (baseURL.length === 0) return json(res, 400, { error: 'baseURL is required' })
         let apiKey: string
         try {
-          apiKey = await resolveProbeKey(ctx, routes, provider, typeof body.apiKey === 'string' ? body.apiKey.trim() : '')
+          apiKey = await resolveProbeKey(ctx, routes, provider, typeof body.apiKey === 'string' ? body.apiKey.trim() : '', typeof body.apiKeyEnv === 'string' ? body.apiKeyEnv.trim() : undefined)
         } catch (error) {
           return json(res, 400, { error: safeMessage(error) })
         }
@@ -347,7 +617,7 @@ export function registerRoutes(ctx: Context, routes: RouteContext): void {
         if (baseURL.length === 0) return json(res, 400, { error: 'baseURL is required' })
         let apiKey: string
         try {
-          apiKey = await resolveProbeKey(ctx, routes, provider, typeof body.apiKey === 'string' ? body.apiKey.trim() : '')
+          apiKey = await resolveProbeKey(ctx, routes, provider, typeof body.apiKey === 'string' ? body.apiKey.trim() : '', typeof body.apiKeyEnv === 'string' ? body.apiKeyEnv.trim() : undefined)
         } catch (error) {
           return json(res, 400, { error: safeMessage(error) })
         }
@@ -394,9 +664,17 @@ export function registerRoutes(ctx: Context, routes: RouteContext): void {
       if (!trustedRequest(req)) return json(res, 403, { error: 'forbidden' })
       const config = routes.config()
       const models: Record<string, string[]> = {}
-      for (const def of PROVIDERS) {
-        if (config.providers[def.key].apiKeyEnv !== undefined) {
-          models[def.route] = config.providers[def.key].models?.map((m) => m.id) ?? []
+      const list = config.endpoints ?? []
+      if (list.length > 0) {
+        for (const endpoint of list) {
+          if (endpoint.apiKeyEnv === undefined) continue
+          models[endpointRoute(endpoint, list)] = endpoint.models?.map((m) => m.id) ?? []
+        }
+      } else {
+        for (const def of PROVIDERS) {
+          if (config.providers[def.key].apiKeyEnv !== undefined) {
+            models[def.route] = config.providers[def.key].models?.map((m) => m.id) ?? []
+          }
         }
       }
       json(res, 200, { routes: routes.listRegisteredRoutes(), models })

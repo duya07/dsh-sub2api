@@ -1,112 +1,63 @@
-# dsh-sub2api
+# dsh-sub2api：DSH 0.2 适配
 
-[English](./README.md)
+[English](./README.md) | [变更记录](./CHANGELOG.md)
 
-将你的 [sub2api](https://github.com/Wei-Shaw/sub2api) 网关接入 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)，作为模型供应商。
+将 [Sub2API](https://github.com/Wei-Shaw/sub2api) 网关接入 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)。这是 **duya07/dsh-sub2api** fork，基于 GodD6366 上游提交 `610ff6f26370a587223cff27449ea894ad87da96`。包名暂保持 `@godd6366/dsh-sub2api`，版本为 `0.2.1-dsh02.5`；保留包名不表示 npm 上已有此 fork 的新版本。本次交付不是 npm 发布。
 
-sub2api 是一个把订阅配额转成 OpenAI 兼容 API 的网关。它的模型是：**每个 API key 绑定一个分组，分组决定平台**（OpenAI / Claude / Grok）与可用模型。三个供应商路由（`sub2api-openai`、`sub2api-claude`、`sub2api-grok`）由 harness 自带的 pi-ai 适配器（`dsh-llm-pi-ai`）承载：本插件把 `llm-sub2api:` 配置翻译成 `llm-pi-ai:` provider profiles（共享同一个**裸主机** baseURL，不带 `/v1`），协议序列化、流式、用量统计全部由 pi-ai 完成。同一个网关同时提供 OpenAI、Claude、Grok 模型，harness 按 key 所在分组自动路由请求。
+## 已验证范围
 
-## 功能
+本地适配已在 **DSH 0.2.0-rc.2**、**desktop 2.0.17** 上验证，不承诺其他版本兼容。
 
-- **一个 baseURL，三个供应商路由**：`sub2api-openai`、`sub2api-claude`、`sub2api-grok`——各自配置独立 key 与至少一个模型，两者就绪后即注册为可用的 LLM 供应商。
-- **流式对话（由 pi-ai 承载）**：SSE 流式、工具调用、reasoning 增量与 token 用量由 `dsh-llm-pi-ai` 映射到 harness 协议，天然正确处理 Responses API 的 `function_call` 顶层条目等 wire format 细节。
-- **模型发现**：一键「获取模型」调用 `GET {baseURL}/v1/models`（携带该 key），每个路由的模型目录与 sub2api 分组实际提供的完全一致。
-- **正式模型参数**：设置页按模型 ID 从 [models.dev](https://models.dev/) 自动补全名称、Context Window 与最大输出长度；匹配不到的字段保持为空，可手动填写。
-- **推理等级（思考模式）**：对话模型选择器可直接调整 `reasoning_effort`（透传网关）；设置页「思考强度」字段按 [models.dev](https://models.dev/) 的 `reasoning_options` 逐模型填充真实档位（如 `gpt-5.6-sol` 为 none/low/medium/high/xhigh/max，`deepseek-v4-flash` 为 low/high/max），设置页可编辑展示；可在 settings.yaml 中用 `reasoningEfforts: []` 显式关闭。
-- **用量查询**：「查看用量」调用 `GET {baseURL}/v1/usage`，汇总配额、余额、限流窗口与订阅周期用量。
-- **标准配置**：baseURL 与模型目录存于 `llm-sub2api:` 设置节（`$DSH_HOME/settings.yaml`，web 模型页可直接写入）；key 走 harness 凭据存储。
-- **供应商图标**来自 [lobehub/lobe-icons](https://lobehub.com/icons)，以 SVG 内嵌在设置页中。
+- 原适配的 136 项自动化测试及服务端、客户端类型检查通过；发布副本增加 1 项 packaging 测试，合计 137 项通过。
+- 浏览器检查覆盖 192 个案例、2,320 次断言和四种视口尺寸。
+- Review 已完成。浏览器检查使用 mock 服务，不是生产环境完整聊天验证。
 
-## 安装
+网关可用性、额度、协议支持和真实思考行为取决于上游服务。此次适配不证明 `upstream_error` 已解决。
 
-要求 DeepSeek Harness **0.1.2-rc.1 或更新版本**；已在 **0.1.3-alpha.2** 上通过类型检查、构建与兼容测试。本版本使用设置服务的 `installSection` API 与 `dsh-client-ui-renderer` 浏览器服务，不再依赖已停止发布的 `dsh-client-runtime`。
+## 安装此 Fork
 
-```bash
-dsh plugin --profile web add @godd6366/dsh-sub2api
-```
+推荐从此仓库构建本地 tarball。不要安装 npm 同名包后就认为得到此 fork。准备满足 `package.json` 要求的 Node（`^22.19.0 || >=24.0.0`）、npm、Git 及上述已验证 DSH 环境。
 
-或直接在本仓库目录：
-
-```bash
-dsh plugin --profile web add .
-```
-
-## 配置
-
-打开 **设置 → Sub2API 模型**（或直接编辑 `$DSH_HOME/settings.yaml`）：
-
-```yaml
-llm-sub2api:
-  baseURL: http://localhost:8080
-  providers:
-    openai:
-      apiKeyEnv: SUB2API_OPENAI_API_KEY
-      models:
-        - id: gpt-5.6-sol
-    claude:
-      apiKeyEnv: SUB2API_CLAUDE_API_KEY
-    grok:
-      apiKeyEnv: SUB2API_GROK_API_KEY
-  tools:
-    generate:
-      provider: openai
-      model: gpt-image-1
-```
-
-通过凭据服务存储各 key（web 模型页可写入，或导出 `SUB2API_OPENAI_API_KEY=…` 等环境变量）。某平台填了 key 且至少有一个模型后对应路由才激活；清空 key（或清空模型列表）即可移除该路由。
-
-### 网关协议（自动选择）
-
-sub2api 网关的每个分组在上游走**原生协议**，pi-ai 按分组自动选择，无需配置。设置里填**裸主机**（不带 `/v1`）：OpenAI 风格端点会自动补 `/v1`，Anthropic SDK 会自动补 `/v1/messages`：
-
-| 分组 | 自动选择 | 请求端点 |
-|---|---|---|
-| openai | `openai-responses` | `POST {baseURL}/v1/responses` |
-| claude | `anthropic-messages` | `POST {baseURL}/v1/messages` |
-| grok | `openai-completions` | `POST {baseURL}/v1/chat/completions` |
-
-这样网关不需要做 chat/completions ↔ 原生协议转换——并行工具调用正是在这种转换中丢失/错位工具名和 ID，导致 `unknown tool ""`、`missing required property` 报错。如某分组网关实际不走原生协议，可在 settings.yaml 中为该 provider 显式声明 `api`（仅 yaml 层支持，设置页不提供该选项）：
-
-```yaml
-llm-sub2api:
-  baseURL: http://localhost:8080
-  providers:
-    openai:
-      apiKeyEnv: SUB2API_OPENAI_API_KEY
-      api: openai-completions   # 可选：openai-completions / openai-responses / anthropic-messages
-      models:
-        - id: gpt-5.6-sol
-```
-
-`api` 可选值：`openai-completions`（`/v1/chat/completions`）、`openai-responses`（`/v1/responses`）、`anthropic-messages`（`/v1/messages`）；省略 = 按上表自动。
-
-### 与 dsh-llm-pi-ai 的关系
-
-本插件不再自己实现 LLM 协议层：三个 `sub2api-*` 路由由 `dsh-llm-pi-ai`（dsh-base 内置、dormant 挂载）通过 `llm-pi-ai:` settings profiles 承载。插件在每次 `llm-sub2api:` 配置变化（及启动）时把裸主机 baseURL、各组模型与 key 引用翻译成 hand-declared profiles 写入 `llm-pi-ai:`，路由即时注册 / 撤销。设置页、模型发现（`GET /v1/models`）、用量查询（`GET /v1/usage`）、生图工具仍由本插件提供。
-
-> **依赖说明（pi-ai 多轮守卫）**：pi-ai 的 `AssistantMessage.usage` 在类型上是必填字段，前缀 token 估算会解引用它。harness 路径本身已安全——dsh 自带的 `dsh-llm-pi-ai` 会给重建的 assistant 消息挂零 `Usage`。本插件启动时仍会给 dsh 安装目录的 `@earendil-works/pi-ai/dist/utils/estimate.js` 打防御性守卫（`assistant.usage !== undefined` 才计入前缀 token），保护其它不挂 `usage` 的调用方。补丁幂等，升级 dsh 后自动重打；只读安装失败时可手动执行 `node scripts/patch-pi-ai.mjs`。
-
-### 图片输入 / 思考强度
-
-模型详情支持手动选择图片输入和填写思考档位（逗号分隔）。补全数据保留手动设置。独立识图工具及其模型选择项已移除；生图模型仍可配置。
-
-
-会话中直接给模型挂图，需要模型声明 `image` 输入模态（否则 harness 在发送前拒绝，提示"当前模型不支持图片"）。**这两个字段可以在模型详情里手动设置**；models.dev 仅用于补全未填写的值：
-
-- **图片输入**：models.dev 的 `attachment` / `modalities.input` 有数据就自动定（如 gpt-5.6-luna → 文本+图片，deepseek-v4-flash → 仅文本）；没数据时按模型 ID 推断（`gpt-*` / `claude-*` / `gemini-*` / `grok-*` / `glm-*` 等默认支持图片），可手动在 settings.yaml 写 `input: [text]` 强制仅文本。
-- **思考强度**：models.dev 的 `reasoning_options` 有数据就自动填真实档位（如 deepseek-v4-flash → high/max）；否则默认 low/medium/high，`reasoning: false` 的模型自动标为不支持。
-
-挂图后请求按分组原生协议携带图片：openai → Responses `input_image`，claude → Messages `image`（base64），grok → chat/completions `image_url`。
-
-
-## 开发
-
-```bash
-npm install
-npm run build     # tsdown → lib/ + client wrapper
+```sh
+git clone https://github.com/duya07/dsh-sub2api.git
+cd dsh-sub2api
+npm ci --ignore-scripts
 npm run typecheck
+npm test
+npm pack --ignore-scripts
+dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.5.tgz
 ```
 
-## 许可证
+`npm test` 会先构建再测试，因此即使安装、打包时禁用了生命周期脚本，打出的包仍包含刚构建的 `lib` 产物。上述 tgz 名称来自当前包名与版本；若它们发生变化，请使用 `npm pack` 实际输出的文件名。安装后重启 DSH/desktop。若使用的不是 `desktop` profile，将命令中的 `desktop` 换成自己的 profile 名称。
 
-MIT
+包声明 `dsh.bundle.patch: ./cordis.patch.yml`，该 bundled patch 以现有包名插入 `llm-sub2api` 条目。普通聊天配置会翻译给宿主 `llm-pi-ai` 适配器，本插件不替换其流式、工具调用实现，也不修改默认 agent 模型。
+
+## 优先使用设置 UI
+
+打开 DSH 设置中的 **Sub2API** 页面，添加端点，选择平台、协议，填写各端点的 key，获取或手动添加模型并保存；之后在 DSH 选择相应路由与模型。端点与模型详情可折叠，便于管理较大的列表。
+
+每个端点拥有独立名称、base URL、凭据引用、协议和模型目录。支持多个独立网关，也支持同一平台使用多个 key。Sub2API key 绑定网关分组，因此获取模型展示的是该 key 返回的目录，不等于所有模型或功能均可用。
+
+base URL 填裸主机地址，例如 `http://localhost:8080` 或 `https://gateway.example.test`，不要附带 `/v1`。协议按网关实际接口选择：`openai-responses`、`openai-completions` 或 `anthropic-messages`。端点 URL 留空时继承共享 URL。非空 `endpoints` 列表完全接管聊天 profiles；没有该列表或列表为空时，仍兼容 legacy 共享 URL 与 `providers` 配置。
+
+DSH 0.2 通过所选 profile 的 **`cordis.patch.yml`** 保存配置，不是 `settings.yaml`。优先用 UI，不需要手改真实 profile。适配使用 `settings.configure({ auto: false })`、volatile schema 字段及延后的首次 profile 同步，遵循 DSH 0.2 loader 契约。
+
+key 写入 DSH credential store，配置只保留引用名，不保存 key 值，读回接口也不返回秘密。例如 `EXAMPLE_SUB2API_KEY_REF` 只是虚构引用名，不是凭据值。只有配置保存明确报告 `not-committed` 时才补偿凭据写入；已提交或提交状态未知时保留 key，包括提交结果不确定的非 200 响应，避免损坏可能已经保存的配置。
+
+## 保守思考档位探测
+
+自动探测**默认关闭**。单个模型可用按钮手动探测。开启某端点的自动选项后，显式执行 **Discover / 获取模型** 或 **Fill / 补全数据** 才会将其模型加入探测队列；所有符合条件的模型都会排队，不只第一项，单纯打开设置页不会启动这类自动批次。
+
+服务端共享全局调度器，上一次探测请求结束到下一次开始至少间隔 **5 秒**。探测会发出真实请求，可能消耗额度。排队及进行中的任务均可取消；限流可能延长等待。
+
+结果分为 `accepted`、`unsupported`、`unknown`。只有同一档位得到两次精确、明确的参数拒绝，且无 effort 参数的对照请求成功，才会从建议中剔除。超时、认证或额度问题、上游失败、模糊响应和参数被转换等情况保持 `unknown`，保守保留该档位。`accepted` 仅表示参数被接受，**不能证明模型实际进行了思考**。
+
+新建、未编辑且未关闭思考的模型行可以自动填入建议；已保存行、手动修改的思考字段和显式 `off` 不会被自动覆盖。使用 **Apply suggestion / 应用建议** 后再保存，才能主动接受修改。公共模型元数据只是起点，不是网关支持的证明。
+
+## 用量与生图
+
+用量查询访问所选端点的 `/v1/usage`，需要网关支持。生图使用单独选择的生成模型，将结果保存到工作区，并可返回内联图片附件；支持端点路由，也兼容 legacy provider 引用。当前聊天模型不必具有生图能力，实际图片及协议支持仍取决于网关。
+
+## 许可与归属
+
+采用 [MIT](./LICENSE)，保留上游 **Copyright (c) 2026 GodD6366** 版权声明。DSH 0.2 适配与 fork 维护位于 [duya07/dsh-sub2api](https://github.com/duya07/dsh-sub2api)，上游来源为文首所列提交。此次适配范围见变更记录。

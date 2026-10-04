@@ -22,9 +22,13 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@deepseek-ai/dsh-settings'
+import type { SettingsForms } from '@deepseek-ai/dsh-settings'
 import type { PiAiModelProfile, PiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
-import type { CatalogModel, Config, ProviderKey, ProviderProfile } from './index.ts'
+// The section schema, as a value: the bridge stores profiles through it so that
+// what it compares against a read-back is exactly what the settings service
+// keeps — every defaulted field filled in.
+import { Config as PiAiSectionSchema } from '@deepseek-ai/dsh-llm-pi-ai'
+import type { CatalogModel, Config, ProviderEndpoint, ProviderKey, ProviderProfile } from './index.ts'
 import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
@@ -139,24 +143,127 @@ function translateProfile(key: ProviderKey, profile: ProviderProfile, baseURL: s
   }
 }
 
+/** Display label for one platform, used when an endpoint carries no name. */
+export function platformLabel(platform: ProviderKey): string {
+  return PROVIDERS.find((def) => def.key === platform)?.label ?? platform
+}
+
+/**
+ * Route id for one endpoint.
+ *
+ * Compatibility is the whole point of this function: agent presets, the
+ * default-model setting and the user's own notes all name routes, so an
+ * unnamed endpoint that is the only one on its platform keeps the historical
+ * `sub2api-<platform>` id. A name — or a sibling on the same platform —
+ * switches it to `sub2api-<platform>-<slug>`.
+ */
+export function endpointRoute(endpoint: ProviderEndpoint, all: readonly ProviderEndpoint[]): string {
+  const siblings = all.filter((entry) => entry.platform === endpoint.platform)
+  const slug = routeSlug(endpoint.name ?? '')
+  if (slug.length > 0) return `${ROUTE_PREFIX}${endpoint.platform}-${slug}`
+  if (siblings.length <= 1) return `${ROUTE_PREFIX}${endpoint.platform}`
+  return `${ROUTE_PREFIX}${endpoint.platform}-${siblings.indexOf(endpoint) + 1}`
+}
+
+/**
+ * Normalize a user-supplied endpoint name into a route id fragment. Route ids
+ * travel through profile dict keys and through model ids (`<route>/<model>`),
+ * so only letters (any script), digits and single dashes survive.
+ */
+function routeSlug(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
 /**
  * Build the `llm-pi-ai` provider profile dict for every configured sub2api
  * group. A group is emitted only when it has both a key and at least one
  * model — a hand-declared pi-ai route needs a non-empty `models` list, and a
  * keyless group would otherwise surface as an unauthenticated route.
+ *
+ * A non-empty `endpoints` list takes over completely: each entry carries its
+ * own host and key, so the legacy per-platform slots are ignored rather than
+ * merged — merging would resurrect routes the user just deleted.
  */
 export function translateToPiAi(config: Config): Record<string, PiAiProviderProfile> {
-  const baseURL = (config.baseURL ?? '').trim().replace(/\/+$/, '')
-  if (baseURL.length === 0) return {}
+  const fallback = (config.baseURL ?? '').trim().replace(/\/+$/, '')
+  const endpoints = config.endpoints ?? []
+  if (endpoints.length > 0) return translateEndpoints(endpoints, fallback)
+  if (fallback.length === 0) return {}
   const profiles: Record<string, PiAiProviderProfile> = {}
   for (const def of PROVIDERS) {
     const profile = config.providers[def.key]
     if (profile.apiKeyEnv === undefined) continue
     const models = (profile.models ?? []).filter((model) => model.id.length > 0)
     if (models.length === 0) continue
-    profiles[def.route] = translateProfile(def.key, { ...profile, models }, baseURL, def.label)
+    profiles[def.route] = translateProfile(def.key, { ...profile, models }, fallback, def.label)
   }
   return profiles
+}
+
+function translateEndpoints(
+  endpoints: readonly ProviderEndpoint[],
+  fallback: string,
+): Record<string, PiAiProviderProfile> {
+  const profiles: Record<string, PiAiProviderProfile> = {}
+  for (const endpoint of endpoints) {
+    if (endpoint.apiKeyEnv === undefined) continue
+    const host = (endpoint.baseURL ?? '').trim().replace(/\/+$/, '') || fallback
+    if (host.length === 0) continue
+    const models = (endpoint.models ?? []).filter((model) => model.id.length > 0)
+    if (models.length === 0) continue
+    const label = (endpoint.name ?? '').trim() || platformLabel(endpoint.platform)
+    profiles[endpointRoute(endpoint, endpoints)] = translateProfile(endpoint.platform, endpoint, host, label)
+  }
+  return profiles
+}
+
+/**
+ * Read the stored `llm-pi-ai` section.
+ *
+ * DSH 0.2 removed `Settings.get()`. The only public read path left is
+ * `describe()`, which reports each loader entry's resolved config projected
+ * through that entry's own schema. The projection is faithful for this section:
+ * pi-ai declares `providers` as a `z.dict(...)`, which serializes as a `dict`
+ * node rather than an `object`, and `projectForm` passes every non-object node
+ * through untouched — so the dynamic provider keys (including routes the user
+ * declared by hand on the Models page) survive the round trip. Values come back
+ * with schema defaults filled in, which is what a later read sees as well, so
+ * the idempotence check in the caller still matches.
+ *
+ * `describe()` re-stamps the entry revision and emits
+ * `settings/document-updated` as a side effect; that is unavoidable on the only
+ * read path, and this bridge only reads when it is about to write anyway.
+ */
+function readPiAiSection(settings: SettingsForms): PiAiSettingsSection | undefined {
+  const described = settings.describe().find((entry) => entry.ns === PI_AI_NS)
+  const value = described?.value
+  if (value === undefined || value === null || typeof value !== 'object') return undefined
+  return value as PiAiSettingsSection
+}
+
+/**
+ * Put a provider map through pi-ai's own schema, so that comparing it against a
+ * read-back compares like with like.
+ *
+ * Storing a section runs it through that schema, which fills every defaulted
+ * field — `defaultContextWindow`, `defaultInput`, `streamIdleTimeoutMs`, the
+ * request-image budgets, and so on. A value read back therefore never equals the
+ * bare literal this module builds, and comparing the two raw makes every boot
+ * look like a change. Every boot would then write, and a write is a loader-level
+ * edit that re-registers pi-ai's providers: the plugin and the loader would keep
+ * handing the work back to each other instead of finishing startup.
+ */
+function normalizeProviders(providers: Record<string, PiAiProviderProfile>): Record<string, PiAiProviderProfile> {
+  const resolved: unknown = PiAiSectionSchema({ providers }).providers
+  if (resolved !== null && typeof resolved === 'object'
+    && typeof (resolved as { get?: unknown }).get === 'function') {
+    return (resolved as { get(): unknown }).get() as Record<string, PiAiProviderProfile>
+  }
+  return resolved as Record<string, PiAiProviderProfile>
 }
 
 /**
@@ -170,14 +277,15 @@ export function translateToPiAi(config: Config): Record<string, PiAiProviderProf
 export async function syncPiAiProfiles(ctx: Context, config: Config): Promise<void> {
   const settings = ctx.get('settings')
   if (settings === undefined) return
-  const current = settings.get(PI_AI_NS) as PiAiSettingsSection | undefined
+  const current = readPiAiSection(settings)
   const providers: Record<string, PiAiProviderProfile> = { ...(current?.providers ?? {}) }
   for (const route of Object.keys(providers)) {
     if (route.startsWith(ROUTE_PREFIX)) delete providers[route]
   }
   Object.assign(providers, translateToPiAi(config))
-  const next: PiAiSettingsSection = { providers }
+  const normalized = normalizeProviders(providers)
   const before = JSON.stringify(current?.providers ?? {})
-  if (JSON.stringify(providers) === before) return
+  if (JSON.stringify(normalized) === before) return
+  const next: PiAiSettingsSection = { providers: normalized }
   await settings.replace(PI_AI_NS, next)
 }
