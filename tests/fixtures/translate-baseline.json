@@ -1,0 +1,252 @@
+{
+  "legacy": {
+    "sub2api-openai": {
+      "apiKeyEnv": "TEST_OPENAI",
+      "displayName": "Sub2API OpenAI",
+      "api": "openai-responses",
+      "baseURL": "https://gateway.test/v1",
+      "models": [
+        {
+          "id": "gpt-x",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoningEfforts": {
+            "off": "none",
+            "high": "high",
+            "max": "max"
+          }
+        }
+      ],
+      "defaultContextWindow": 128000,
+      "defaultMaxTokens": 8192,
+      "defaultInput": [
+        "text"
+      ],
+      "retryPolicy": {
+        "mode": "normal",
+        "maxRetries": 5,
+        "retryableCodes": [
+          "RATE_LIMIT",
+          "SERVER",
+          "TIMEOUT",
+          "TRANSPORT",
+          "EMPTY_RESPONSE"
+        ],
+        "backoff": {
+          "initialDelayMs": 1000,
+          "maxDelayMs": 120000,
+          "jitterRatio": 0.2
+        }
+      }
+    },
+    "sub2api-claude": {
+      "apiKeyEnv": "TEST_CLAUDE",
+      "displayName": "Sub2API Claude",
+      "api": "anthropic-messages",
+      "baseURL": "https://gateway.test",
+      "models": [
+        {
+          "id": "claude-x",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoningEfforts": {
+            "off": "none",
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          }
+        }
+      ],
+      "defaultContextWindow": 128000,
+      "defaultMaxTokens": 8192,
+      "defaultInput": [
+        "text"
+      ],
+      "retryPolicy": {
+        "mode": "normal",
+        "maxRetries": 5,
+        "retryableCodes": [
+          "RATE_LIMIT",
+          "SERVER",
+          "TIMEOUT",
+          "TRANSPORT",
+          "EMPTY_RESPONSE"
+        ],
+        "backoff": {
+          "initialDelayMs": 1000,
+          "maxDelayMs": 120000,
+          "jitterRatio": 0.2
+        }
+      }
+    },
+    "sub2api-grok": {
+      "apiKeyEnv": "TEST_GROK",
+      "displayName": "Sub2API Grok",
+      "api": "openai-completions",
+      "baseURL": "https://gateway.test/v1",
+      "models": [
+        {
+          "id": "grok-x",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoningEfforts": {
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          }
+        }
+      ],
+      "defaultContextWindow": 128000,
+      "defaultMaxTokens": 8192,
+      "defaultInput": [
+        "text"
+      ],
+      "retryPolicy": {
+        "mode": "normal",
+        "maxRetries": 5,
+        "retryableCodes": [
+          "RATE_LIMIT",
+          "SERVER",
+          "TIMEOUT",
+          "TRANSPORT",
+          "EMPTY_RESPONSE"
+        ],
+        "backoff": {
+          "initialDelayMs": 1000,
+          "maxDelayMs": 120000,
+          "jitterRatio": 0.2
+        }
+      }
+    }
+  },
+  "endpoints": {
+    "sub2api-claude-team-b": {
+      "apiKeyEnv": "TEST_CLAUDE_B",
+      "displayName": "Sub2API team-b",
+      "api": "anthropic-messages",
+      "baseURL": "https://gateway.test",
+      "models": [
+        {
+          "id": "claude-y",
+          "contextWindow": 200000,
+          "maxTokens": 32000,
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoningEfforts": {
+            "low": "low",
+            "high": "high"
+          }
+        }
+      ],
+      "defaultContextWindow": 128000,
+      "defaultMaxTokens": 8192,
+      "defaultInput": [
+        "text"
+      ],
+      "retryPolicy": {
+        "mode": "normal",
+        "maxRetries": 5,
+        "retryableCodes": [
+          "RATE_LIMIT",
+          "SERVER",
+          "TIMEOUT",
+          "TRANSPORT",
+          "EMPTY_RESPONSE"
+        ],
+        "backoff": {
+          "initialDelayMs": 1000,
+          "maxDelayMs": 120000,
+          "jitterRatio": 0.2
+        }
+      }
+    },
+    "sub2api-openai": {
+      "apiKeyEnv": "TEST_OPENAI_B",
+      "displayName": "Sub2API OpenAI",
+      "api": "openai-responses",
+      "baseURL": "https://gateway.test/v1",
+      "models": [
+        {
+          "id": "gpt-y",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoningEfforts": {
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          }
+        }
+      ],
+      "defaultContextWindow": 128000,
+      "defaultMaxTokens": 8192,
+      "defaultInput": [
+        "text"
+      ],
+      "retryPolicy": {
+        "mode": "normal",
+        "maxRetries": 5,
+        "retryableCodes": [
+          "RATE_LIMIT",
+          "SERVER",
+          "TIMEOUT",
+          "TRANSPORT",
+          "EMPTY_RESPONSE"
+        ],
+        "backoff": {
+          "initialDelayMs": 1000,
+          "maxDelayMs": 120000,
+          "jitterRatio": 0.2
+        }
+      }
+    },
+    "sub2api-claude-2": {
+      "apiKeyEnv": "TEST_CLAUDE_C",
+      "displayName": "Sub2API Claude",
+      "api": "anthropic-messages",
+      "baseURL": "https://gateway.test",
+      "models": [
+        {
+          "id": "claude-only-off",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoningEfforts": {
+            "off": "none"
+          }
+        }
+      ],
+      "defaultContextWindow": 128000,
+      "defaultMaxTokens": 8192,
+      "defaultInput": [
+        "text"
+      ],
+      "retryPolicy": {
+        "mode": "normal",
+        "maxRetries": 5,
+        "retryableCodes": [
+          "RATE_LIMIT",
+          "SERVER",
+          "TIMEOUT",
+          "TRANSPORT",
+          "EMPTY_RESPONSE"
+        ],
+        "backoff": {
+          "initialDelayMs": 1000,
+          "maxDelayMs": 120000,
+          "jitterRatio": 0.2
+        }
+      }
+    }
+  }
+}

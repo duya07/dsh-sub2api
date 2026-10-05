@@ -211,22 +211,25 @@ async function gatewayFetch(
   host: ImageToolHost,
   resolved: ResolvedToolModel,
   path: string,
-  body: Record<string, unknown>,
+  body: Record<string, unknown> | FormData,
   signal: AbortSignal | undefined,
   accept: string,
 ): Promise<Response> {
   const apiKey = await host.resolveApiKey(resolved.route, resolved.profile)
+  const multipart = body instanceof FormData
   let response: Response
   try {
     response = await fetch(`${resolved.baseURL}${path}`, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${apiKey}`,
-        'content-type': 'application/json',
+        // A multipart body must stay unlabelled so fetch appends its own
+        // boundary; declaring application/json here would break the edit call.
+        ...(multipart ? {} : { 'content-type': 'application/json' }),
         accept,
         ...attributionHeaders(),
       },
-      body: JSON.stringify(body),
+      body: multipart ? body : JSON.stringify(body),
       signal,
     })
   } catch (error) {
@@ -367,6 +370,116 @@ function extractImageFromText(text: string): { kind: 'data'; mediaType: ImageMed
   return undefined
 }
 
+/** One entry of the `referenceImages` tool argument (a DSH image reference). */
+interface ImageReferenceInput {
+  attachmentId: string
+  mediaType: string
+  bytes: number
+  width: number
+  height: number
+  name?: string
+  originalDimensions?: { width: number; height: number }
+}
+
+interface ResolvedReference {
+  data: Uint8Array
+  mediaType: ImageMediaType
+  name: string
+}
+
+/** The slice of the DSH attachment service the edit path needs. */
+interface AttachmentService {
+  imageLimits?: {
+    maxImagesPerMessage?: number
+    maxImageBytes?: number
+    maxMessageImageBytes?: number
+  }
+  readImage(ref: ImageAttachmentRef, signal?: AbortSignal): Promise<{ ref: ImageAttachmentRef; data: Uint8Array }>
+}
+
+const MAX_REFERENCE_IMAGES = 5
+const IMAGE_MEDIA_TYPES: readonly ImageMediaType[] = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+const ATTACHMENT_ID_PATTERN = /^sha256:[a-f0-9]{64}$/
+const INVALID_REFERENCE_MESSAGE = 'sub2api: referenceImages 含有无效引用；请复制完整的图片引用（attachmentId/mediaType/bytes/width/height），本地文件先调用 read_image 读取。不要省略引用重试编辑。'
+
+function getAttachments(ctx: Context): AttachmentService | undefined {
+  return (ctx as Context & { get(name: 'attachments'): AttachmentService | undefined }).get('attachments')
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+
+function isCompleteReference(value: unknown): value is ImageReferenceInput {
+  if (typeof value !== 'object' || value === null) return false
+  const ref = value as Partial<ImageReferenceInput>
+  return typeof ref.attachmentId === 'string'
+    && ATTACHMENT_ID_PATTERN.test(ref.attachmentId)
+    && typeof ref.mediaType === 'string'
+    && IMAGE_MEDIA_TYPES.includes(ref.mediaType as ImageMediaType)
+    && isPositiveInteger(ref.bytes)
+    && isPositiveInteger(ref.width)
+    && isPositiveInteger(ref.height)
+}
+
+/**
+ * Turn the raw `referenceImages` argument into image bytes.
+ *
+ * `undefined` means "no references given": the caller then generates a new
+ * image. Anything else must resolve to 1–5 complete, distinct references that
+ * the DSH attachment service can hand back — an unusable reference is an error,
+ * never a silent downgrade to text-to-image.
+ */
+async function resolveReferenceImages(
+  refs: unknown,
+  attachments: AttachmentService | undefined,
+  signal: AbortSignal | undefined,
+): Promise<ResolvedReference[] | undefined> {
+  if (refs === undefined) return undefined
+  if (attachments === undefined) {
+    throw new Error('sub2api: 图片编辑需要 DSH 附件服务；当前会话没有挂载 attachments，无法读取引用图片')
+  }
+  if (!Array.isArray(refs) || refs.length < 1 || refs.length > MAX_REFERENCE_IMAGES) {
+    throw new Error('sub2api: referenceImages 必须是 1–5 张完整图片引用；只有生成新图时才省略该字段，不要用空数组回退到文生图。')
+  }
+  const limits = attachments.imageLimits
+  if (limits?.maxImagesPerMessage !== undefined && refs.length > limits.maxImagesPerMessage) {
+    throw new Error(`sub2api: referenceImages 超出 DSH 图片限制（单次最多 ${limits.maxImagesPerMessage} 张）`)
+  }
+  const seen = new Set<string>()
+  const resolved: ResolvedReference[] = []
+  let total = 0
+  for (const entry of refs) {
+    if (!isCompleteReference(entry)) throw new Error(INVALID_REFERENCE_MESSAGE)
+    const ref = entry
+    if (seen.has(ref.attachmentId)) {
+      throw new Error(`sub2api: referenceImages 含有重复图片（${ref.attachmentId}）；每张图片只能引用一次`)
+    }
+    seen.add(ref.attachmentId)
+    if (limits?.maxImageBytes !== undefined && ref.bytes > limits.maxImageBytes) {
+      throw new Error(`sub2api: referenceImages 超出 DSH 图片限制（单张最大 ${limits.maxImageBytes} 字节）`)
+    }
+    total += ref.bytes
+    if (limits?.maxMessageImageBytes !== undefined && total > limits.maxMessageImageBytes) {
+      throw new Error(`sub2api: referenceImages 超出 DSH 图片限制（合计最大 ${limits.maxMessageImageBytes} 字节）`)
+    }
+    const mediaType = ref.mediaType as ImageMediaType
+    const stored = await attachments.readImage({
+      attachmentId: ref.attachmentId,
+      mediaType,
+      bytes: ref.bytes,
+      width: ref.width,
+      height: ref.height,
+      ...(typeof ref.name === 'string' && ref.name.length > 0 ? { name: ref.name } : {}),
+    } as ImageAttachmentRef, signal)
+    const name = typeof ref.name === 'string' && ref.name.length > 0
+      ? ref.name
+      : `reference-${resolved.length + 1}${extensionForMediaType(mediaType)}`
+    resolved.push({ data: stored.data, mediaType, name })
+  }
+  return resolved
+}
+
 function defaultOutputName(mediaType: ImageMediaType): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '-').slice(0, 19)
   return `generated-${stamp}${extensionForMediaType(mediaType)}`
@@ -427,6 +540,39 @@ async function generateViaImagesApi(
   throw new Error('sub2api: image API returned no image data')
 }
 
+/**
+ * Edit existing images through the OpenAI-shaped multipart endpoint the
+ * gateway exposes. The parts of the multipart body follow the public
+ * images/edits contract (`model`, `prompt`, repeated `image[]`).
+ */
+async function generateViaImagesEdit(
+  host: ImageToolHost,
+  resolved: ResolvedToolModel,
+  prompt: string,
+  references: ResolvedReference[],
+  signal: AbortSignal | undefined,
+  maxBytes: number,
+): Promise<{ data: Uint8Array; mediaType: ImageMediaType; revisedPrompt?: string }> {
+  const form = new FormData()
+  form.append('model', resolved.model)
+  form.append('prompt', prompt)
+  for (const reference of references) {
+    form.append('image[]', new Blob([reference.data], { type: reference.mediaType }), reference.name)
+  }
+  const response = await gatewayFetch(host, resolved, '/images/edits', form, signal, 'application/json')
+  const payload: unknown = await response.json()
+  const image = extractGeneratedImage(payload)
+  if (image === undefined) throw new Error('sub2api /images/edits: gateway returned no image data')
+  if (image.data !== undefined && image.mediaType !== undefined) {
+    return { data: image.data, mediaType: image.mediaType, ...(image.revisedPrompt !== undefined ? { revisedPrompt: image.revisedPrompt } : {}) }
+  }
+  if (image.url !== undefined) {
+    const downloaded = await loadRemoteImage(image.url, signal, maxBytes)
+    return { ...downloaded, ...(image.revisedPrompt !== undefined ? { revisedPrompt: image.revisedPrompt } : {}) }
+  }
+  throw new Error('sub2api /images/edits: gateway returned no image data')
+}
+
 async function generateViaChat(
   host: ImageToolHost,
   resolved: ResolvedToolModel,
@@ -457,12 +603,12 @@ export function registerImageTools(ctx: Context, host: ImageToolHost): void {
     toolCtx.systemPrompt.section({
       name: 'tool:generate_image',
       order: 119,
-      text: 'Use the generate_image tool to create an image with the configured image model and write it to the workspace. Call it when the current chat model cannot generate images. The tool returns the saved file path, not the image bytes.',
+      text: 'Use the generate_image tool to create an image with the configured image model and write it to the workspace. Call it when the current chat model cannot generate images. Pass referenceImages (1–5 complete image references) to edit existing images; omit it to generate a new one. The tool returns the saved file path, not the image bytes.',
     })
 
     toolCtx.tools.register(defineTool({
       name: GENERATE_IMAGE_NAME,
-      description: 'Generate an image with the configured image model and write it to the workspace. Use this when the current chat model cannot generate images. Returns the saved file path.',
+      description: 'Generate or edit an image with the configured image model and write it to the workspace. Use this when the current chat model cannot generate images. Pass referenceImages (1–5 complete DSH image references) to edit existing images; an unusable reference is an error and is never replaced by a new generation. Returns the saved file path.',
       parameters: {
         prompt: {
           type: 'string',
@@ -482,6 +628,30 @@ export function registerImageTools(ctx: Context, host: ImageToolHost): void {
           type: 'string',
           enum: [...GENERATE_QUALITIES],
           description: 'Requested quality when the image API supports it.',
+        },
+        referenceImages: {
+          type: 'array',
+          description: 'Ordered DSH image references (1–5) to edit. Copy complete references from a user attachment, a read_image result, or an earlier generated image; a local file must be read with read_image first. Omitting this field generates a new image.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              attachmentId: { type: 'string', required: true },
+              mediaType: { type: 'string', enum: [...IMAGE_MEDIA_TYPES], required: true },
+              bytes: { type: 'integer', required: true },
+              width: { type: 'integer', required: true },
+              height: { type: 'integer', required: true },
+              name: { type: 'string' },
+              originalDimensions: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  width: { type: 'integer', required: true },
+                  height: { type: 'integer', required: true },
+                },
+              },
+            },
+          },
         },
       },
       output: {
@@ -537,18 +707,26 @@ export function registerImageTools(ctx: Context, host: ImageToolHost): void {
         const prompt = args.prompt.trim()
         if (prompt.length === 0) throw new Error('prompt must be a non-empty string')
         const resolved = resolveToolModel(host.config(), 'generate')
-        const maxBytes = ctx.get('attachments')?.imageLimits.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES
+        const attachments = getAttachments(ctx)
+        const maxBytes = attachments?.imageLimits?.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES
+        const references = await resolveReferenceImages(args.referenceImages, attachments, exec.signal)
         let image: { data: Uint8Array; mediaType: ImageMediaType; revisedPrompt?: string }
-        try {
-          image = await generateViaImagesApi(host, resolved, {
-            prompt,
-            ...(args.size !== undefined ? { size: args.size } : {}),
-            ...(args.quality !== undefined ? { quality: args.quality } : {}),
-          }, exec.signal, maxBytes)
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          if (!/HTTP 404|HTTP 405|HTTP 501|not found|unknown endpoint|does not exist|not implemented/i.test(message)) throw error
-          image = await generateViaChat(host, resolved, prompt, exec.signal, maxBytes)
+        if (references !== undefined) {
+          // Editing never falls back to text-to-image: a failed edit must
+          // surface, otherwise the references would be silently dropped.
+          image = await generateViaImagesEdit(host, resolved, prompt, references, exec.signal, maxBytes)
+        } else {
+          try {
+            image = await generateViaImagesApi(host, resolved, {
+              prompt,
+              ...(args.size !== undefined ? { size: args.size } : {}),
+              ...(args.quality !== undefined ? { quality: args.quality } : {}),
+            }, exec.signal, maxBytes)
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            if (!/HTTP 404|HTTP 405|HTTP 501|not found|unknown endpoint|does not exist|not implemented/i.test(message)) throw error
+            image = await generateViaChat(host, resolved, prompt, exec.signal, maxBytes)
+          }
         }
         const path = await writeGeneratedFile(ctx, exec, args.file_path, image.data, image.mediaType)
         // Save the generated bytes as a durable attachment so the tool result

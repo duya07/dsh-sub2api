@@ -543,3 +543,23 @@ for (const state of ['unknown', 'accepted']) {
     }
   })
 }
+
+// t1 red test (spec item 2): a control-aborted probe must say why in the status line itself,
+// not only in a per-level tooltip and not as "探测完成".
+for (const [abortReason, hint] of [['rate-limited', '限流'], ['auth-or-quota', '认证'], ['sdk-unavailable', 'SDK']]) {
+  test(`an aborted probe (${abortReason}) states the reason in the status line instead of "探测完成"`, async () => {
+    const p = await page({status: body => ({id: body.id, phase: 'aborted', abortReason, requests: 1, maxRequests: 16, minGapMs: 5000, levels: [{level: 'low', state: 'unknown', reason: abortReason}], suggestion: ['low']})})
+    try {
+      await p.expand(); await p.details()
+      await p.click(p.field('Team A model-a 探测档位'))
+      for (let i = 0; i < 10; i++) await act(async () => {})
+      const status = p.view.root.findAllByProps({className: 's2a_probeStatus'})[0]
+      assert.ok(status, 'the probe status line is rendered')
+      const text = JSON.stringify(status.props.children)
+      assert.equal(text.includes('探测完成'), false, `an aborted batch is not a completed probe: ${text}`)
+      assert.ok(text.includes('探测中止'), `the status line names the abort: ${text}`)
+      assert.ok(text.includes(hint), `the status line names the reason (${hint}): ${text}`)
+      assert.equal(p.view.root.findAllByProps({'aria-label': 'Team A model-a 应用探测建议'}).length, 0)
+    } finally {await p.close()}
+  })
+}

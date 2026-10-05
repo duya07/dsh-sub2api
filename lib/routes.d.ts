@@ -32,6 +32,8 @@ export interface ConfigPayloadEndpoint {
     keyConfigured: boolean;
     api?: ApiProtocol;
     models: CatalogModel[];
+    /** Route-level stream idle timeout in milliseconds; absent keeps the host default. */
+    streamIdleTimeoutMs?: number;
     /** Route id this endpoint currently resolves to. */
     route: string;
 }

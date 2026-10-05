@@ -7,6 +7,8 @@ import { translateToPiAi } from './pi-ai.ts'
 import { API_PROTOCOLS, type ApiProtocol, type Config, type ProviderKey } from './index.ts'
 
 export const PROBE_GAP_MS = 5000
+// A control retry is only worth starting inside the task's own lifetime.
+const PROBE_TASK_TTL_MS = 10 * 60 * 1000
 export const PROBE_LEVELS = ['off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 export type ProbeLevel = typeof PROBE_LEVELS[number]
 export type ProbeReason = 'queued' | 'accepted-parameter' | 'confirmed-rejection' | 'unconfirmed-rejection' | 'no-control' | 'parameter-not-exact' | 'budget-limited' | 'rate-limited' | 'auth-or-quota' | 'upstream-error' | 'ambiguous-error' | 'invalid-stream' | 'timeout' | 'cancelled' | 'sdk-unavailable'
@@ -18,7 +20,9 @@ export interface ProbeDraft {
 export interface ProbeLevelResult { level: ProbeLevel; state: 'accepted' | 'unsupported' | 'unknown'; reason: ProbeReason }
 export interface ProbeView {
   id: string
-  phase: 'queued' | 'running' | 'completed' | 'cancelled' | 'expired'
+  phase: 'queued' | 'running' | 'completed' | 'aborted' | 'cancelled' | 'expired'
+  /** Set only when the no-level control attempt ended the batch before any level was probed. */
+  abortReason?: ProbeReason
   requests: number
   maxRequests: number
   minGapMs: number
@@ -119,7 +123,7 @@ export class ReasoningProbeService {
     if (this.disposed || !key || [...this.tasks.values()].filter(task => ['queued', 'running'].includes(task.view.phase)).length >= 8 || this.tasks.size >= 64) return undefined
     const id = randomUUID(), controller = new AbortController()
     const view: ProbeView = { id, phase: 'queued', requests: 0, maxRequests: 1 + 3 * draft.candidates.length, minGapMs: PROBE_GAP_MS, estimateMs: this.scheduler.estimate() + (1 + 3 * draft.candidates.length) * PROBE_GAP_MS, levels: draft.candidates.map(level => ({level, state: 'unknown', reason: 'queued'})), suggestion: [...draft.candidates] }
-    const timer = setTimeout(() => this.stop(id, 'expired'), 10 * 60 * 1000)
+    const timer = setTimeout(() => this.stop(id, 'expired'), PROBE_TASK_TTL_MS)
     timer.unref()
     const task: ProbeTask = {view, draft: structuredClone(draft), key, controller, timer, touched: this.now()}
     this.tasks.set(id, task)
@@ -157,12 +161,29 @@ export class ReasoningProbeService {
       } finally {clearTimeout(timer)}
     })
   }
+  private abort(task: ProbeTask, reason: ProbeReason): void {
+    task.view.phase = 'aborted'
+    task.view.abortReason = reason
+    for (const result of task.view.levels) result.reason = reason
+  }
   private async execute(task: ProbeTask): Promise<void> {
     try {
-      const initialControl = await this.attempt(task)
+      let initialControl = await this.attempt(task)
       if (task.controller.signal.aborted) return
+      if (initialControl.reason === 'rate-limited') {
+        // Exactly one retry: the transport already paused the shared scheduler until Retry-After,
+        // so the retry cannot become a hidden burst. A window longer than the task's own lifetime
+        // is not worth waiting out.
+        const delay = initialControl.retryAfterUntil !== undefined ? initialControl.retryAfterUntil - this.now() : initialControl.retryAfterMs ?? 0
+        if (delay <= PROBE_TASK_TTL_MS) {
+          const retry = await this.attempt(task)
+          if (task.controller.signal.aborted) return
+          if (retry.kind !== 'accepted' || !retry.transmitted) {this.abort(task, retry.reason); return}
+          initialControl = retry
+        }
+      }
       if (['auth-or-quota', 'sdk-unavailable', 'rate-limited'].includes(initialControl.reason)) {
-        for (const result of task.view.levels) result.reason = initialControl.reason
+        this.abort(task, initialControl.reason)
         return
       }
       for (const result of task.view.levels) {
@@ -188,7 +209,7 @@ export class ReasoningProbeService {
     } catch {
       if (!task.controller.signal.aborted) for (const result of task.view.levels) if (result.reason === 'queued') result.reason = 'upstream-error'
     } finally {
-      if (!task.controller.signal.aborted) task.view.phase = 'completed'
+      if (!task.controller.signal.aborted && task.view.phase !== 'aborted') task.view.phase = 'completed'
       task.view.suggestion = task.view.levels.filter(level => level.state !== 'unsupported').map(level => level.level)
       task.view.estimateMs = 0
       task.key = ''; task.draft.endpoint.apiKey = ''

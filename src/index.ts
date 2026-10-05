@@ -42,6 +42,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { ConfigSaveError, registerRoutes } from './routes.ts'
 import { registerImageTools } from './image-tools.ts'
+import { registerWebSearchProvider } from './web-search.ts'
 import { syncPiAiProfiles } from './pi-ai.ts'
 import { applyPiAiMultiTurnPatch } from './pi-ai-patch.ts'
 
@@ -95,6 +96,33 @@ export const PROVIDERS: readonly ProviderDef[] = [
   { key: 'grok', route: 'sub2api-grok', label: 'Grok', icon: 'grok' },
 ]
 
+/**
+ * How a model's reasoning levels reach an `anthropic-messages` gateway.
+ *
+ * `adaptive` (the default) is what current Claude deployments require: the
+ * request sends `thinking:{type:"adaptive"}` and the selected level travels as
+ * `output_config.effort`. `budget` restores the fixed-budget shape
+ * (`thinking:{type:"enabled",budget_tokens:N}`) that older deployments and
+ * gateways still expect. OpenAI-style protocols carry the level as
+ * `reasoning_effort` / `reasoning.effort`, so they ignore this field.
+ */
+export type ThinkingMode = 'adaptive' | 'budget'
+
+/**
+ * Upper bound the host accepts for one stream-idle timeout, mirroring
+ * `MAX_TIMER_DELAY_MS` of `@deepseek-ai/dsh-timeout`. llm-pi-ai rejects a
+ * larger `streamIdleTimeoutMs` when the translated provider profile is loaded,
+ * so the settings schema clamps it here instead of failing at runtime.
+ */
+export const MAX_STREAM_IDLE_TIMEOUT_MS: number = 2_147_483_647
+
+/**
+ * Default stream idle timeout used by the host when a model does not set one
+ * (`DEFAULT_STREAM_IDLE_TIMEOUT_MS` in `@deepseek-ai/dsh-llm-pi-ai`: 300000 ms
+ * = 5 minutes). Kept here only for documentation and tests.
+ */
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS: number = 300_000
+
 export interface CatalogModel {
   /** Model id sent to the provider and accepted by {@link GenerateOptions.model}. */
   id: string
@@ -120,6 +148,13 @@ export interface CatalogModel {
    * vocabularies such as `xhigh`/`max`/`none`).
    */
   reasoningEfforts?: string[]
+  /**
+   * Thinking dispatch this model's levels use on an `anthropic-messages` route.
+   * Absent: `adaptive` (see {@link ThinkingMode}). Set `budget` only for a
+   * gateway that still rejects adaptive thinking. Ignored on OpenAI-style
+   * routes, which carry the level themselves.
+   */
+  thinkingMode?: ThinkingMode
 }
 
 export interface ProviderProfile {
@@ -160,6 +195,20 @@ export interface ProviderEndpoint {
   api?: ApiProtocol
   /** Advisory model catalog for this entry. */
   models?: CatalogModel[]
+  /**
+   * Override of the host's stream idle timeout for this route, in milliseconds.
+   * Absent keeps the host default ({@link DEFAULT_STREAM_IDLE_TIMEOUT_MS},
+   * 5 minutes): a route that stalls longer than that between stream chunks (a
+   * long thinking turn, a loaded proxy) is aborted as an idle timeout, and
+   * raising this value is the only way to keep such a request alive without
+   * changing host settings.
+   *
+   * Route-level on purpose: llm-pi-ai reads `streamIdleTimeoutMs` from the
+   * provider profile (`PiAiProviderProfile`, not `PiAiModelProfile`), so one
+   * endpoint carries one value; per-model entries would be ignored by the host.
+   * Bounded by {@link MAX_STREAM_IDLE_TIMEOUT_MS}.
+   */
+  streamIdleTimeoutMs?: number
 }
 
 /** One dedicated model used by a global image tool, independent of the chat route. */
@@ -173,6 +222,26 @@ export interface ImageToolModelRef {
 export interface ImageToolsConfig {
   /** Image-generation model used by the global `generate_image` tool. */
   generate?: ImageToolModelRef
+  /** Gateway-backed candidate for the host's global `web_search` tool. */
+  webSearch?: WebSearchToolConfig
+}
+
+/**
+ * Opt-in switch for the gateway-backed search candidate.
+ *
+ * It stays off by default and must name both a route and a model before the
+ * provider reports itself available: the host refuses to pick between two
+ * available search providers (`WEB_PROVIDER_AMBIGUOUS`), so a candidate that
+ * announced itself while the user has not asked for it would break the search
+ * setup that already works.
+ */
+export interface WebSearchToolConfig {
+  /** Explicit opt-in; while this is not `true` the provider stays unavailable. */
+  enabled?: boolean
+  /** Route id of the endpoint that serves the search request. */
+  provider?: string
+  /** Model id sent with the search request. */
+  model?: string
 }
 
 export interface Config {
@@ -247,6 +316,9 @@ const catalogModel = z.object({
   // configuration exposes low/medium/high (image models are excluded at
   // resolve time); an explicit empty array still opts the model out.
   reasoningEfforts: z.array(z.string()).default(REASONING_EFFORTS.map((effort) => effort.id)),
+  // Absent keeps the adaptive dispatch that anthropic routes default to; only
+  // an explicit 'budget' asks for the fixed-budget thinking shape.
+  thinkingMode: z.union([z.const('adaptive'), z.const('budget')]),
 })
 
 const apiProtocol = z.union([
@@ -274,12 +346,27 @@ const providerEndpoint = z.object({
   apiKeyEnv: z.string().role('credential-ref'),
   api: apiProtocol,
   models: z.array(catalogModel),
+  // Route-level (llm-pi-ai reads it from the provider profile), and
+  // deliberately without a default: the loader normalizes every section through
+  // this schema, and a materialized value would be written back on the next
+  // save as a timeout the user never chose. While unset, llm-pi-ai applies its
+  // own default (300000 ms).
+  streamIdleTimeoutMs: z.number().step(1).min(1).max(MAX_STREAM_IDLE_TIMEOUT_MS),
 })
 
 // Keep these fields optional strings. The settings layer fills absent
 // objects, and a required union here would reject a still-empty tools
 // section (or silently coerce it) before the user picks a model.
 const imageToolModelRef = z.object({
+  provider: z.string(),
+  model: z.string(),
+})
+
+// Same reasoning as above: every field stays optional so an enabled-but-unfilled
+// section still saves. The provider itself treats a half-filled section as
+// "not available" instead of failing the save.
+const webSearchToolConfig = z.object({
+  enabled: z.boolean(),
   provider: z.string(),
   model: z.string(),
 })
@@ -316,6 +403,7 @@ export const Config: z<ConfigInput> = z.object({
   endpoints: z.array(providerEndpoint).volatile(),
   tools: z.object({
     generate: imageToolModelRef,
+    webSearch: webSearchToolConfig,
   }).volatile(),
 }) as unknown as z<ConfigInput>
 
@@ -518,6 +606,14 @@ export function apply(ctx: Context, config: ConfigInput): void {
   })
 
   registerImageTools(ctx, {
+    config: () => current(),
+    resolveApiKey,
+  })
+
+  // A *candidate* into the host's web seam, not a replacement for the official
+  // provider: it reports itself unavailable until the user enables it, so the
+  // existing search setup keeps working untouched.
+  registerWebSearchProvider(ctx, {
     config: () => current(),
     resolveApiKey,
   })

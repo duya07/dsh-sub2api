@@ -2,14 +2,31 @@
 
 [中文文档](./README.zh.md) | [Changelog](./CHANGELOG.md)
 
-Connect a [Sub2API](https://github.com/Wei-Shaw/sub2api) gateway to [DeepSeek Harness](https://github.com/deepseek-ai/dsh). This is the **duya07/dsh-sub2api** fork of GodD6366's plugin, based on upstream commit `610ff6f26370a587223cff27449ea894ad87da96`. The package identity remains `@godd6366/dsh-sub2api`, version `0.2.1-dsh02.5`; that name does not identify a new fork release on npm. This delivery is not an npm publication.
+Connect a [Sub2API](https://github.com/Wei-Shaw/sub2api) gateway to [DeepSeek Harness](https://github.com/deepseek-ai/dsh). This is the **duya07/dsh-sub2api** fork of GodD6366's plugin, based on upstream commit `610ff6f26370a587223cff27449ea894ad87da96`. The package identity remains `@godd6366/dsh-sub2api`, version `0.2.1-dsh02.7`; that name does not identify a new fork release on npm. This delivery is not an npm publication.
+
+## Changes Relative To Upstream
+
+Compared with upstream `GodD6366/dsh-sub2api` at `610ff6f`:
+
+1. **DSH 0.2.0-rc.2 adaptation.** Upstream calls the removed `settings.installSection`; this fork uses `settings.configure({ auto: false })`, volatile fields and deferred boot synchronization.
+2. **Multiple independent endpoints and keys**, each with its own base URL, protocol, key reference and model list; foldable endpoint rows.
+3. **Safer key saving.** Preflight before any key write, serialized saves, and compensation only for a proven `not-committed` configuration failure.
+4. **Conservative reasoning-effort probing**, default off, with a global five-second request gap, cancellation, and no removal of a level without repeated explicit rejection plus a successful control.
+5. **Probe aborts are now visible.** If the no-effort control request fails (429, authentication/quota, SDK unavailable), the probe shows "probe aborted" with the reason instead of "probe complete" with every level unknown. A rate-limited control is retried once after the gateway's `Retry-After` (never when it exceeds the 10-minute task lifetime); 401/403 are never retried. Other control failures still continue level by level, and no level is removed.
+6. **Claude-platform thinking fix.** Anthropic-messages routes write `compat.forceAdaptiveThinking: true` (opt out per model with `thinkingMode: 'budget'`), because models such as `claude-sonnet-5-5` reject the `thinking.type=enabled` request the host would otherwise send (`400 ... requires adaptive thinking`). OpenAI-route output is unchanged and covered by a baseline fixture.
+7. **Optional `web_search` provider** for the host web seam (id `sub2api`, off by default, only available for `openai-responses` endpoints, one request without hidden retries).
+8. **`generate_image` reference-image editing** through `/images/edits` (1-5 references; invalid references are an error, never silently downgraded to text-to-image), and a fix so an endpoint route chosen in the image slot is saved instead of dropped.
+9. **Per-endpoint `streamIdleTimeoutMs`** for slow streaming gateways.
+
+Not adopted from reviewed projects: subscription logins, account pools, quota displays, Claude Code credential reuse, changing the default model, `x_search` and video generation.
 
 ## Verified Scope
 
 The local adaptation was verified with **DSH 0.2.0-rc.2** and **desktop 2.0.17**. Other versions are not covered by this verification.
 
-- The original adaptation's 136 automated tests and server/client typechecks passed. The release copy adds packaging and bounded cross-platform test-wait regressions, for 138 passing tests in total.
-- Browser checks covered 192 cases and 2,320 assertions across four viewport sizes.
+- The full suite (195 tests, including packaging and cross-platform wait regressions) and server/client typechecks passed. Behaviors above were covered by mutation tests that fail when the fix is removed.
+- Browser checks (192 cases, 2,320 assertions, four viewport sizes) were run on the earlier 0.2.1-dsh02.5 build; they have not been re-run for the later additions.
+- Against a real gateway, one `/images/edits` request and one `web_search` request were each verified once on the 0.2.1-dsh02.6 build. The probe-abort/retry behavior (item 5) and the Claude adaptive-thinking fix (item 6) are verified with mocked transports and the real host SDK request builder only; they have **not** been verified against a real rate-limited or Claude-platform gateway.
 - Review was completed. Browser checks used mocked services and are not a production full-chat validation.
 
 Gateway availability, quotas, protocol support and actual reasoning behavior depend on the upstream service.
@@ -25,7 +42,7 @@ npm ci --ignore-scripts
 npm run typecheck
 npm test
 npm pack --ignore-scripts
-dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.5.tgz
+dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.7.tgz
 ```
 
 `npm test` runs the build before the tests, so the tarball includes freshly built `lib` assets even though lifecycle scripts are disabled during install and packing. The tarball name above follows the current package name and version; use the actual filename printed by `npm pack` if they change. Restart DSH/desktop after adding the plugin. If your active profile is not `desktop`, replace `desktop` with your own profile name.

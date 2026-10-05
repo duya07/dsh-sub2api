@@ -54,6 +54,30 @@ export interface ProviderDef {
 }
 /** The provider routes this plugin owns, keyed by sub2api platform name. */
 export declare const PROVIDERS: readonly ProviderDef[];
+/**
+ * How a model's reasoning levels reach an `anthropic-messages` gateway.
+ *
+ * `adaptive` (the default) is what current Claude deployments require: the
+ * request sends `thinking:{type:"adaptive"}` and the selected level travels as
+ * `output_config.effort`. `budget` restores the fixed-budget shape
+ * (`thinking:{type:"enabled",budget_tokens:N}`) that older deployments and
+ * gateways still expect. OpenAI-style protocols carry the level as
+ * `reasoning_effort` / `reasoning.effort`, so they ignore this field.
+ */
+export type ThinkingMode = 'adaptive' | 'budget';
+/**
+ * Upper bound the host accepts for one stream-idle timeout, mirroring
+ * `MAX_TIMER_DELAY_MS` of `@deepseek-ai/dsh-timeout`. llm-pi-ai rejects a
+ * larger `streamIdleTimeoutMs` when the translated provider profile is loaded,
+ * so the settings schema clamps it here instead of failing at runtime.
+ */
+export declare const MAX_STREAM_IDLE_TIMEOUT_MS: number;
+/**
+ * Default stream idle timeout used by the host when a model does not set one
+ * (`DEFAULT_STREAM_IDLE_TIMEOUT_MS` in `@deepseek-ai/dsh-llm-pi-ai`: 300000 ms
+ * = 5 minutes). Kept here only for documentation and tests.
+ */
+export declare const DEFAULT_STREAM_IDLE_TIMEOUT_MS: number;
 export interface CatalogModel {
     /** Model id sent to the provider and accepted by {@link GenerateOptions.model}. */
     id: string;
@@ -79,6 +103,13 @@ export interface CatalogModel {
      * vocabularies such as `xhigh`/`max`/`none`).
      */
     reasoningEfforts?: string[];
+    /**
+     * Thinking dispatch this model's levels use on an `anthropic-messages` route.
+     * Absent: `adaptive` (see {@link ThinkingMode}). Set `budget` only for a
+     * gateway that still rejects adaptive thinking. Ignored on OpenAI-style
+     * routes, which carry the level themselves.
+     */
+    thinkingMode?: ThinkingMode;
 }
 export interface ProviderProfile {
     /** Credential reference (environment-variable name) resolved per request through `ctx.credentials`. */
@@ -117,6 +148,20 @@ export interface ProviderEndpoint {
     api?: ApiProtocol;
     /** Advisory model catalog for this entry. */
     models?: CatalogModel[];
+    /**
+     * Override of the host's stream idle timeout for this route, in milliseconds.
+     * Absent keeps the host default ({@link DEFAULT_STREAM_IDLE_TIMEOUT_MS},
+     * 5 minutes): a route that stalls longer than that between stream chunks (a
+     * long thinking turn, a loaded proxy) is aborted as an idle timeout, and
+     * raising this value is the only way to keep such a request alive without
+     * changing host settings.
+     *
+     * Route-level on purpose: llm-pi-ai reads `streamIdleTimeoutMs` from the
+     * provider profile (`PiAiProviderProfile`, not `PiAiModelProfile`), so one
+     * endpoint carries one value; per-model entries would be ignored by the host.
+     * Bounded by {@link MAX_STREAM_IDLE_TIMEOUT_MS}.
+     */
+    streamIdleTimeoutMs?: number;
 }
 /** One dedicated model used by a global image tool, independent of the chat route. */
 export interface ImageToolModelRef {
@@ -128,6 +173,25 @@ export interface ImageToolModelRef {
 export interface ImageToolsConfig {
     /** Image-generation model used by the global `generate_image` tool. */
     generate?: ImageToolModelRef;
+    /** Gateway-backed candidate for the host's global `web_search` tool. */
+    webSearch?: WebSearchToolConfig;
+}
+/**
+ * Opt-in switch for the gateway-backed search candidate.
+ *
+ * It stays off by default and must name both a route and a model before the
+ * provider reports itself available: the host refuses to pick between two
+ * available search providers (`WEB_PROVIDER_AMBIGUOUS`), so a candidate that
+ * announced itself while the user has not asked for it would break the search
+ * setup that already works.
+ */
+export interface WebSearchToolConfig {
+    /** Explicit opt-in; while this is not `true` the provider stays unavailable. */
+    enabled?: boolean;
+    /** Route id of the endpoint that serves the search request. */
+    provider?: string;
+    /** Model id sent with the search request. */
+    model?: string;
 }
 export interface Config {
     /** OpenAI-compatible gateway base URL, e.g. http://localhost:8080/v1. */

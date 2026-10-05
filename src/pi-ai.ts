@@ -28,7 +28,7 @@ import type { PiAiModelProfile, PiAiProviderProfile } from '@deepseek-ai/dsh-llm
 // what it compares against a read-back is exactly what the settings service
 // keeps — every defaulted field filled in.
 import { Config as PiAiSectionSchema } from '@deepseek-ai/dsh-llm-pi-ai'
-import type { CatalogModel, Config, ProviderEndpoint, ProviderKey, ProviderProfile } from './index.ts'
+import type { ApiProtocol, CatalogModel, Config, ProviderEndpoint, ProviderKey, ProviderProfile } from './index.ts'
 import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
@@ -77,7 +77,10 @@ function catalogInputModalities(model: { id: string; input?: Array<'text' | 'ima
  * (responses) — exactly what this plugin used to send. An empty list declares
  * a non-reasoning model; unmappable ids are dropped.
  */
-function translateReasoningEfforts(model: CatalogModel): false | Partial<Record<string, string | null>> | undefined {
+function translateReasoningEfforts(
+  model: CatalogModel,
+  adaptive: boolean,
+): false | Partial<Record<string, string | null>> | undefined {
   const ids = model.reasoningEfforts
   if (ids === undefined) {
     // The plugin's old default: every non-image model exposes low/medium/high.
@@ -86,16 +89,35 @@ function translateReasoningEfforts(model: CatalogModel): false | Partial<Record<
   }
   if (ids.length === 0) return false
   const efforts: Record<string, string | null> = {}
+  let declaresOff = false
   for (const id of ids) {
-    if (id === 'none') efforts.off = 'none'
-    else if (THINKING_LEVELS.includes(id)) efforts[id] = id
+    if (id === 'none' || id === 'off') {
+      // An adaptive-thinking deployment also rejects `thinking:{type:"disabled"}`,
+      // so "off" has no wire spelling worth sending on an anthropic route: the
+      // level is dropped, and the host pins the undeclared level to null, which
+      // pi-ai reads as "send no thinking parameter at all". OpenAI-style
+      // protocols keep the verbatim spelling (`reasoning_effort: "none"`).
+      declaresOff = true
+      if (!adaptive) efforts.off = id === 'none' ? 'none' : 'off'
+    } else if (THINKING_LEVELS.includes(id)) {
+      efforts[id] = id
+    }
+  }
+  if (adaptive && declaresOff && Object.keys(efforts).length === 0) {
+    // Only "off" survived. The host refuses a profile offering nothing beyond
+    // off ("offers no level beyond \"off\"") and refuses an empty dict too, so
+    // the model is declared as a non-reasoning one instead.
+    return false
   }
   return Object.keys(efforts).length > 0 ? efforts : undefined
 }
 
 /** One configured catalog model, translated onto pi-ai's per-model fields. */
-function translateModel(model: CatalogModel): PiAiModelProfile {
-  const reasoningEfforts = translateReasoningEfforts(model)
+function translateModel(model: CatalogModel, api: ApiProtocol): PiAiModelProfile {
+  // Adaptive dispatch is the default on anthropic routes; an explicit
+  // `thinkingMode: 'budget'` asks for the legacy fixed-budget shape instead.
+  const adaptive = api === 'anthropic-messages' && model.thinkingMode !== 'budget'
+  const reasoningEfforts = translateReasoningEfforts(model, adaptive)
   return {
     id: model.id,
     ...(model.name !== undefined && model.name.length > 0 ? { name: model.name } : {}),
@@ -103,6 +125,17 @@ function translateModel(model: CatalogModel): PiAiModelProfile {
     ...(model.maxTokens !== undefined ? { maxTokens: model.maxTokens } : {}),
     input: catalogInputModalities(model),
     ...(reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
+    // pi-ai picks the Anthropic thinking shape from the model alone. Without
+    // this switch it always sends the fixed-budget shape
+    // (`thinking:{type:"enabled",budget_tokens:N}`), which current Claude
+    // deployments reject with 400 invalid_request_error ("... requires adaptive
+    // thinking or thinking.type=between_tools; omit thinking or use one of
+    // those modes"); with it, the selected level travels as
+    // `output_config.effort` and `thinking:{type:"adaptive"}`. OpenAI-style
+    // protocols carry the level themselves, so the switch is set on anthropic
+    // routes only, and only when the catalog did not ask for the budget shape
+    // (`thinkingMode: 'budget'`).
+    ...(adaptive ? { compat: { forceAdaptiveThinking: true } } : {}),
   }
 }
 
@@ -117,14 +150,27 @@ function translateModel(model: CatalogModel): PiAiModelProfile {
  * `/v1/messages` itself — so OpenAI-style routes get the `/v1`-rooted URL and
  * the anthropic route gets the bare host.
  */
-function translateProfile(key: ProviderKey, profile: ProviderProfile, baseURL: string, label: string): PiAiProviderProfile {
+/**
+ * One gateway route on pi-ai's provider-profile fields.
+ *
+ * `streamIdleTimeoutMs` is a route-level field the host keeps on the provider
+ * profile (`PiAiProviderProfile`), not on a model, and it is passed as its own
+ * argument: only an endpoint entry can set it, so the legacy per-platform
+ * `providers` groups always keep the host default.
+ */
+function translateProfile(key: ProviderKey, profile: ProviderProfile, baseURL: string, label: string, streamIdleTimeoutMs?: number): PiAiProviderProfile {
   const api = apiProtocolForKey(key, profile)
   return {
     ...(profile.apiKeyEnv !== undefined ? { apiKeyEnv: profile.apiKeyEnv } : {}),
     displayName: `Sub2API ${label}`,
     api,
     baseURL: api === 'anthropic-messages' ? gatewayAnthropicRoot(baseURL) : gatewayApiRoot(baseURL),
-    models: (profile.models ?? []).map(translateModel),
+    models: (profile.models ?? []).map((model) => translateModel(model, api)),
+    // Route-level stream idle timeout: llm-pi-ai reads `streamIdleTimeoutMs`
+    // from the provider profile, so the endpoint's value travels here and an
+    // absent one lets the host default (DEFAULT_STREAM_IDLE_TIMEOUT_MS, 300000)
+    // apply — which is what every previously stored configuration gets.
+    ...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
     // Route-level fallbacks mirror the plugin's old adapter defaults, so a
     // catalog entry that omits a size keeps sizing like before.
     defaultContextWindow: DEFAULT_CONTEXT_WINDOW,
@@ -216,7 +262,7 @@ function translateEndpoints(
     const models = (endpoint.models ?? []).filter((model) => model.id.length > 0)
     if (models.length === 0) continue
     const label = (endpoint.name ?? '').trim() || platformLabel(endpoint.platform)
-    profiles[endpointRoute(endpoint, endpoints)] = translateProfile(endpoint.platform, endpoint, host, label)
+    profiles[endpointRoute(endpoint, endpoints)] = translateProfile(endpoint.platform, endpoint, host, label, endpoint.streamIdleTimeoutMs)
   }
   return profiles
 }

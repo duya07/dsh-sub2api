@@ -18,7 +18,7 @@ import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { assertUsableApiKey } from '@deepseek-ai/dsh-llm'
-import { API_PROTOCOLS, PROVIDERS, gatewayApiRoot, type ApiProtocol, type CatalogModel, type Config, type ImageToolModelRef, type ImageToolsConfig, type ProviderEndpoint, type ProviderKey, type ProviderProfile } from './index.ts'
+import { API_PROTOCOLS, MAX_STREAM_IDLE_TIMEOUT_MS, PROVIDERS, gatewayApiRoot, type ApiProtocol, type CatalogModel, type Config, type ImageToolModelRef, type ImageToolsConfig, type ProviderEndpoint, type ProviderKey, type ProviderProfile, type WebSearchToolConfig } from './index.ts'
 import { endpointRoute, platformLabel } from './pi-ai.ts'
 import { ReasoningProbeService, parseProbeDraft } from './reasoning-probe.ts'
 
@@ -44,6 +44,8 @@ export interface ConfigPayloadEndpoint {
   keyConfigured: boolean
   api?: ApiProtocol
   models: CatalogModel[]
+  /** Route-level stream idle timeout in milliseconds; absent keeps the host default. */
+  streamIdleTimeoutMs?: number
   /** Route id this endpoint currently resolves to. */
   route: string
 }
@@ -119,6 +121,7 @@ function readProviderConfig(config: Config): ConfigPayload {
     keyConfigured: endpoint.apiKeyEnv !== undefined,
     ...(endpoint.api !== undefined ? { api: endpoint.api } : {}),
     models: endpoint.models?.map((model) => ({ ...model })) ?? [],
+    ...(endpoint.streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs: endpoint.streamIdleTimeoutMs } : {}),
     route: endpointRoute(endpoint, list),
   }))
   return {
@@ -128,6 +131,15 @@ function readProviderConfig(config: Config): ConfigPayload {
     endpoints,
     tools: {
       ...(config.tools?.generate !== undefined ? { generate: { ...config.tools.generate } } : {}),
+      ...(config.tools?.webSearch !== undefined
+        ? {
+            webSearch: {
+              enabled: config.tools.webSearch.enabled === true,
+              provider: config.tools.webSearch.provider ?? '',
+              model: config.tools.webSearch.model ?? '',
+            },
+          }
+        : {}),
     },
   }
 }
@@ -164,6 +176,9 @@ function structuredCatalogModel(value: unknown): CatalogModel | undefined {
   const reasoningEfforts = Array.isArray(raw.reasoningEfforts)
     ? (raw.reasoningEfforts as unknown[]).filter((effort): effort is string => typeof effort === 'string' && effort.length > 0)
     : undefined
+  // 'adaptive' / 'budget' is the only accepted spelling; anything else is
+  // dropped so a stored catalog keeps matching the settings schema.
+  const thinkingMode = raw.thinkingMode === 'adaptive' || raw.thinkingMode === 'budget' ? raw.thinkingMode : undefined
   const input = Array.isArray(raw.input)
     ? (raw.input as unknown[]).filter((modality): modality is 'text' | 'image' => modality === 'text' || modality === 'image')
     : undefined
@@ -173,6 +188,7 @@ function structuredCatalogModel(value: unknown): CatalogModel | undefined {
     ...(contextWindow !== undefined ? { contextWindow } : {}),
     ...(maxTokens !== undefined ? { maxTokens } : {}),
     ...(reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
+    ...(thinkingMode !== undefined ? { thinkingMode } : {}),
     ...(input !== undefined && input.length > 0 ? { input } : {}),
   }
 }
@@ -219,22 +235,52 @@ function isProviderKey(value: string): value is ProviderKey {
   return PROVIDERS.some((def) => def.key === value)
 }
 
+/**
+ * Read one image-tool slot. Both spellings the settings UI can emit are
+ * accepted: a bare platform key (`openai`) and an endpoint route id
+ * (`sub2api-openai-gw`, `toolOptions` emits `<endpoint.route>:<modelId>`).
+ * {@link resolveToolModel} maps each of them back — route id first, platform
+ * key second. An unknown name is not rejected here: the tool reports a clear
+ * error when it resolves the model, so a stale route never blocks a save.
+ */
 function readToolModelRef(value: unknown): ImageToolModelRef | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
   const raw = value as Record<string, unknown>
   const provider = typeof raw.provider === 'string' ? raw.provider.trim() : ''
   const model = typeof raw.model === 'string' ? raw.model.trim() : ''
-  if (!isProviderKey(provider) || model.length === 0) return undefined
+  if (provider.length === 0 || model.length === 0) return undefined
   return { provider, model }
+}
+
+/**
+ * Read the search section. Unlike {@link readToolModelRef} this also accepts an
+ * endpoint route id, because a search route has to name *which* endpoint answers
+ * it: with several endpoints on one platform the bare platform key cannot say.
+ * An unknown route is not rejected here — the provider reports itself
+ * unavailable for it, which is the same posture the host applies to a provider
+ * that cannot serve requests.
+ */
+function readWebSearchTool(value: unknown, fallback: WebSearchToolConfig | undefined): WebSearchToolConfig | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return fallback
+  const raw = value as Record<string, unknown>
+  if (raw.enabled !== true) return undefined
+  const provider = typeof raw.provider === 'string' ? raw.provider.trim() : ''
+  const model = typeof raw.model === 'string' ? raw.model.trim() : ''
+  if (provider.length === 0 || model.length === 0) return undefined
+  return { enabled: true, provider, model }
 }
 
 function readImageTools(value: unknown, fallback: ImageToolsConfig | undefined): ImageToolsConfig | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return fallback
   const raw = value as Record<string, unknown>
   const generate = readToolModelRef(raw.generate)
-  if (generate === undefined) return undefined
+  // The two tool sections are independent: an unusable image slot must not take
+  // the search section down with it (and vice versa).
+  const webSearch = readWebSearchTool(raw.webSearch, fallback?.webSearch)
+  if (generate === undefined && webSearch === undefined) return undefined
   return {
     ...(generate !== undefined ? { generate } : {}),
+    ...(webSearch !== undefined ? { webSearch } : {}),
   }
 }
 
@@ -485,6 +531,16 @@ export function registerRoutes(ctx: Context, routes: RouteContext): void {
             // Rows arrive in page order, so the previous entry at this index
             // supplies the catalog when the request omits one.
             const previous = current.endpoints?.[parsed.length]
+            // Route-level stream idle timeout, bounded like the settings schema:
+            // a value the host would reject must not survive a settings round
+            // trip, so anything unusable is dropped rather than stored.
+            const rawTimeout = raw.streamIdleTimeoutMs
+            const streamIdleTimeoutMs = typeof rawTimeout === 'number'
+              && Number.isSafeInteger(rawTimeout)
+              && rawTimeout > 0
+              && rawTimeout <= MAX_STREAM_IDLE_TIMEOUT_MS
+              ? rawTimeout
+              : undefined
             parsed.push({
               ...(name.length > 0 ? { name } : {}),
               ...(host.length > 0 ? { baseURL: host } : {}),
@@ -492,6 +548,7 @@ export function registerRoutes(ctx: Context, routes: RouteContext): void {
               ...(apiKeyEnv.length > 0 ? { apiKeyEnv } : {}),
               ...(api !== undefined ? { api } : {}),
               models: readCatalogModels(raw.models, previous?.models ?? []),
+              ...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
             })
           }
           next.endpoints = parsed

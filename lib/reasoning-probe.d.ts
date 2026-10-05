@@ -25,7 +25,9 @@ export interface ProbeLevelResult {
 }
 export interface ProbeView {
     id: string;
-    phase: 'queued' | 'running' | 'completed' | 'cancelled' | 'expired';
+    phase: 'queued' | 'running' | 'completed' | 'aborted' | 'cancelled' | 'expired';
+    /** Set only when the no-level control attempt ended the batch before any level was probed. */
+    abortReason?: ProbeReason;
     requests: number;
     maxRequests: number;
     minGapMs: number;
@@ -79,6 +81,7 @@ export declare class ReasoningProbeService {
     private sweep;
     private stop;
     private attempt;
+    private abort;
     private execute;
 }
 interface WireModel {

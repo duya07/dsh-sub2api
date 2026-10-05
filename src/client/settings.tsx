@@ -89,6 +89,12 @@ interface EndpointState {
   models: ModelRow[]
   /** Route id the server resolved for this row ('' until saved). */
   route: string
+  /**
+   * Route-level stream idle timeout in milliseconds; '' = leave it to the host
+   * default (300000 ms). llm-pi-ai reads this from the provider profile, so it
+   * is one value per endpoint rather than one per model.
+   */
+  streamIdleTimeoutMs: string
   autoProbeReasoning: boolean
 }
 
@@ -169,6 +175,9 @@ function ensureCss(): void {
   document.head.appendChild(tag)
 }
 
+/** 宿主 `MAX_TIMER_DELAY_MS`（@deepseek-ai/dsh-timeout）的上限。 */
+const MAX_STREAM_IDLE_TIMEOUT_MS = 2_147_483_647
+
 interface CatalogModel {
   id: string
   name?: string
@@ -176,6 +185,8 @@ interface CatalogModel {
   maxTokens?: number
   input?: Array<'text' | 'image'>
   reasoningEfforts?: string[]
+  /** claude（anthropic-messages）路由的思考下发方式；缺省 = adaptive。 */
+  thinkingMode?: 'adaptive' | 'budget'
 }
 
 interface ModelRow {
@@ -193,11 +204,14 @@ interface ModelRow {
   inputEdited?: boolean
   reasoningEdited?: boolean
   fromSaved?: boolean
+  /** '' = 缺省（adaptive）; 'budget' = 固定预算（仅老网关需要） */
+  thinkingMode: string
 }
 
 interface ProbeState {
   id: string
-  phase: 'queued' | 'running' | 'completed' | 'cancelled' | 'expired' | 'unavailable'
+  phase: 'queued' | 'running' | 'completed' | 'aborted' | 'cancelled' | 'expired' | 'unavailable'
+  abortReason?: string
   requests: number
   maxRequests: number
   minGapMs: number
@@ -219,7 +233,7 @@ function probeCandidates(row: ModelRow): string[] {
 }
 
 function probeSignature(endpoint: EndpointState, row: ModelRow, baseURL: string): string {
-  return JSON.stringify([endpoint.baseURL.trim() || baseURL.trim(), endpoint.apiKey, endpoint.apiKeyEnv, endpoint.platform, endpoint.api, endpoint.autoProbeReasoning, row.id, row.contextWindow, row.maxTokens, row.input, row.reasoning, row.effortLevels, row.reasoningEdited, row.fromSaved])
+  return JSON.stringify([endpoint.baseURL.trim() || baseURL.trim(), endpoint.apiKey, endpoint.apiKeyEnv, endpoint.platform, endpoint.api, endpoint.autoProbeReasoning, endpoint.streamIdleTimeoutMs, row.id, row.contextWindow, row.maxTokens, row.input, row.reasoning, row.effortLevels, row.reasoningEdited, row.fromSaved, row.thinkingMode])
 }
 
 const DEFAULT_REASONING_LEVELS = ['low', 'medium', 'high']
@@ -229,8 +243,15 @@ interface ImageToolModelRef {
   model: string
 }
 
+interface WebSearchToolState {
+  enabled: boolean
+  provider: string
+  model: string
+}
+
 interface ImageToolsState {
   generate: ImageToolModelRef
+  webSearch: WebSearchToolState
 }
 
 interface ConfigPayloadEndpoint {
@@ -241,6 +262,8 @@ interface ConfigPayloadEndpoint {
   keyConfigured: boolean
   api?: string
   models: Array<CatalogModel | string>
+  /** Route-level idle bound in milliseconds; absent keeps the host default. */
+  streamIdleTimeoutMs?: number
   route: string
 }
 
@@ -251,6 +274,7 @@ interface ConfigState {
   endpoints?: ConfigPayloadEndpoint[]
   tools?: {
     generate?: ImageToolModelRef
+    webSearch?: { enabled?: boolean; provider?: string; model?: string }
   }
 }
 
@@ -279,7 +303,7 @@ let modelsDevRequest: Promise<ModelsDevCatalog> | undefined
 function modelRow(model: CatalogModel | string = { id: '' }): ModelRow {
   if (typeof model === 'string') {
     const [id = '', name = '', contextWindow = ''] = model.split('|')
-    return { rowId: nextRowId++, id: id.trim(), name: name.trim(), contextWindow: contextWindow.trim(), maxTokens: '', input: '', reasoning: '', effortLevels: '' }
+    return { rowId: nextRowId++, id: id.trim(), name: name.trim(), contextWindow: contextWindow.trim(), maxTokens: '', input: '', reasoning: '', effortLevels: '', thinkingMode: '' }
   }
   const reasoningEfforts = model.reasoningEfforts
   return {
@@ -291,6 +315,7 @@ function modelRow(model: CatalogModel | string = { id: '' }): ModelRow {
     input: model.input === undefined || model.input.length === 0 ? '' : model.input.includes('image') ? 'text-image' : 'text',
     reasoning: reasoningEfforts === undefined ? '' : reasoningEfforts.length === 0 ? 'off' : 'on',
     effortLevels: reasoningEfforts !== undefined && reasoningEfforts.length > 0 ? reasoningEfforts.join(', ') : '',
+    thinkingMode: model.thinkingMode === 'budget' ? 'budget' : '',
   }
 }
 
@@ -420,6 +445,7 @@ function endpointRow(platform: ProviderKey = 'openai'): EndpointState {
     api: '',
     models: [],
     route: '',
+    streamIdleTimeoutMs: '',
     autoProbeReasoning: false,
   }
 }
@@ -437,6 +463,7 @@ function endpointRowFrom(value: ConfigPayloadEndpoint): EndpointState {
     api: typeof value.api === 'string' ? value.api : '',
     models: (value.models ?? []).map((model) => ({...modelRow(model), fromSaved: true})),
     route: typeof value.route === 'string' ? value.route : '',
+    streamIdleTimeoutMs: value.streamIdleTimeoutMs !== undefined ? String(value.streamIdleTimeoutMs) : '',
     autoProbeReasoning: false,
   }
 }
@@ -446,7 +473,7 @@ function emptyToolRef(): ImageToolModelRef {
 }
 
 function emptyTools(): ImageToolsState {
-  return { generate: emptyToolRef() }
+  return { generate: emptyToolRef(), webSearch: { enabled: false, provider: '', model: '' } }
 }
 
 /**
@@ -494,6 +521,25 @@ function serializeToolRef(ref: ImageToolModelRef): ImageToolModelRef | undefined
  * not accept. `title` is the row's display name, so an error names the row it
  * came from instead of a platform the user cannot see on screen any more.
  */
+/**
+ * Validate one endpoint's route-level stream idle timeout. An empty field keeps
+ * the key out of the payload so the host default (300000 ms) applies; anything
+ * else must be a positive integer the host accepts, or the save is refused
+ * instead of storing a value llm-pi-ai would reject while loading the profile.
+ */
+function serializeStreamIdleTimeout(value: string, title: string): number | undefined {
+  const trimmed = value.trim()
+  if (trimmed.length === 0) return undefined
+  const parsed = Number(trimmed)
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`${title} 的流空闲超时必须是正整数（毫秒）`)
+  }
+  if (parsed > MAX_STREAM_IDLE_TIMEOUT_MS) {
+    throw new Error(`${title} 的流空闲超时不能超过 ${MAX_STREAM_IDLE_TIMEOUT_MS} 毫秒`)
+  }
+  return parsed
+}
+
 function serializeModels(rows: readonly ModelRow[], title: string): CatalogModel[] {
   const nonEmptyRows = rows.filter((row) =>
     row.id.trim().length > 0 || row.name.trim().length > 0 || row.contextWindow.length > 0 || row.maxTokens.length > 0 || row.reasoning.length > 0)
@@ -529,6 +575,7 @@ function serializeModels(rows: readonly ModelRow[], title: string): CatalogModel
       ...(maxTokens !== undefined ? { maxTokens } : {}),
       ...(input !== undefined ? { input } : {}),
       ...(reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
+      ...(row.thinkingMode === 'budget' ? { thinkingMode: 'budget' as const } : {}),
     }
   })
 }
@@ -642,6 +689,11 @@ export function Sub2ApiSettings() {
         setEndpoints((cfg.endpoints ?? []).map(endpointRowFrom))
         setTools({
           generate: toolRefFromConfig(cfg.tools?.generate),
+          webSearch: {
+            enabled: cfg.tools?.webSearch?.enabled === true,
+            provider: typeof cfg.tools?.webSearch?.provider === 'string' ? cfg.tools.webSearch.provider : '',
+            model: typeof cfg.tools?.webSearch?.model === 'string' ? cfg.tools.webSearch.model : '',
+          },
         })
         try {
           const catalog = await loadModelsDev()
@@ -800,6 +852,7 @@ export function Sub2ApiSettings() {
         endpoints: submitted.map((endpoint) => {
           const def = providerDefinition(endpoint.platform)
           const title = endpoint.name.trim().length > 0 ? endpoint.name.trim() : def.label
+          const streamIdleTimeoutMs = serializeStreamIdleTimeout(endpoint.streamIdleTimeoutMs, title)
           return {
             name: endpoint.name.trim(),
             baseURL: endpoint.baseURL.trim(),
@@ -808,12 +861,18 @@ export function Sub2ApiSettings() {
             ...(endpoint.apiKeyEnv.length > 0 ? { apiKeyEnv: endpoint.apiKeyEnv } : {}),
             api: endpoint.api,
             models: serializeModels(endpoint.models, title),
+            ...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
           }
         }),
-        tools: {} as { generate?: ImageToolModelRef },
+        tools: {} as { generate?: ImageToolModelRef; webSearch?: { enabled: true; provider: string; model: string } },
       }
       const generate = serializeToolRef(tools.generate)
       if (generate !== undefined) payload.tools.generate = generate
+      if (tools.webSearch.enabled) {
+        const webSearch = serializeToolRef(tools.webSearch)
+        if (webSearch === undefined) throw new Error('启用联网搜索需要先选择一个搜索模型')
+        payload.tools.webSearch = { enabled: true, provider: webSearch.provider, model: webSearch.model }
+      }
       const res = await api<{ ok: boolean; error?: string; routes?: string[]; endpoints?: ConfigPayloadEndpoint[] }>(`${BASE}/config`, { method: 'POST', body: JSON.stringify(payload) })
       if (!mounted.current) return
       if (!res || typeof res !== 'object' || Array.isArray(res) || res.ok !== true) {
@@ -941,6 +1000,12 @@ export function Sub2ApiSettings() {
     }
   }
 
+  const webSearchOptions = toolOptions(endpoints)
+  const webSearchSelected = tools.webSearch.provider.length > 0 && tools.webSearch.model.length > 0
+    ? `${tools.webSearch.provider}:${tools.webSearch.model}`
+    : ''
+  const webSearchKnown = webSearchOptions.some((option) => option.value === webSearchSelected)
+
   return (
     <div className="s2a_section" ref={sectionRef}>
       <h2 className="s2a_title">Sub2API 模型接入</h2>
@@ -997,6 +1062,62 @@ export function Sub2ApiSettings() {
               </div>
             )
           })}
+        </div>
+      </div>
+      <div className="s2a_rowCard">
+        <div className="s2a_rowHead">
+          <div className="s2a_rowIdentity">
+            <span className="s2a_rowName">联网搜索</span>
+            <span className="s2a_rowTag">web_search</span>
+          </div>
+        </div>
+        <div className="s2a_editor">
+          <p className="s2a_intro">
+            启用后本插件会作为 DSH 搜索提供商的一个候选项：由所选模型经网关自带的 web_search 工具联网检索，回答与来源一并返回。
+            默认关闭；关闭时不注册候选，现有搜索提供商不受影响。
+          </p>
+          <div className="s2a_field">
+            <label className="s2a_fieldLabel" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <input
+                type="checkbox"
+                aria-label="启用联网搜索"
+                checked={tools.webSearch.enabled}
+                onChange={(event) => {
+                  const checked = event.target.checked
+                  setTools((current) => ({ ...current, webSearch: { ...current.webSearch, enabled: checked } }))
+                }}
+              />
+              启用联网搜索（默认关闭）
+            </label>
+          </div>
+          <div className="s2a_field">
+            <label className="s2a_fieldLabel">搜索模型</label>
+            <select
+              className="s2a_input"
+              aria-label="搜索模型"
+              disabled={!tools.webSearch.enabled}
+              value={webSearchSelected}
+              onChange={(event) => {
+                const next = webSearchOptions.find((option) => option.value === event.target.value)
+                setTools((current) => ({
+                  ...current,
+                  webSearch: {
+                    ...current.webSearch,
+                    provider: next === undefined ? '' : next.provider,
+                    model: next === undefined ? '' : next.model,
+                  },
+                }))
+              }}
+            >
+              <option value="">未指定</option>
+              {!webSearchKnown && webSearchSelected.length > 0 && (
+                <option value={webSearchSelected}>{`${tools.webSearch.provider} / ${tools.webSearch.model}（不在当前目录）`}</option>
+              )}
+              {webSearchOptions.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </div>
         </div>
       </div>
       <ul className="s2a_rows">
@@ -1103,6 +1224,19 @@ export function Sub2ApiSettings() {
                   </select>
                 </div>
                 <div className="s2a_field">
+                  <label className="s2a_fieldLabel">流空闲超时（毫秒，留空用宿主默认）</label>
+                  <input
+                    className="s2a_input"
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={endpoint.streamIdleTimeoutMs}
+                    placeholder="默认 300000（5 分钟）"
+                    aria-label={`${title} 流空闲超时`}
+                    onChange={(event) => updateEndpoint(endpoint.rowId, { streamIdleTimeoutMs: event.target.value })}
+                  />
+                </div>
+                <div className="s2a_field">
                   <label className="s2a_fieldLabel">模型列表</label>
                   <label className="s2a_probeToggle">
                     <input type="checkbox" aria-label={`${title} 自动探测档位`} checked={endpoint.autoProbeReasoning} onChange={event => updateEndpoint(endpoint.rowId, {autoProbeReasoning: event.target.checked})} />
@@ -1159,7 +1293,7 @@ export function Sub2ApiSettings() {
                             </div>
                             <div className="s2a_probeEntry"><button type="button" className="s2a_btn" aria-label={`${title} ${row.id} 探测档位`} disabled={busy.length > 0 || !row.id.trim() || ['queued', 'running'].includes(probes[row.rowId]?.phase ?? '')} onClick={() => startProbes(endpoint, [row], true)}>探测档位</button></div>
                             {probes[row.rowId] && <div className="s2a_probe" role="status" aria-live="polite">
-                              <span className="s2a_probeStatus">{({queued: '排队中', running: '探测中', completed: '探测完成', cancelled: '已取消', expired: '已超时，未知档位保留', unavailable: '探测不可用，档位保留'})[probes[row.rowId]!.phase]} · {probes[row.rowId]!.requests}/{probes[row.rowId]!.maxRequests} 次请求{['queued', 'running'].includes(probes[row.rowId]!.phase) ? ` · 预计 ${Math.ceil(probes[row.rowId]!.estimateMs / 1000)} 秒` : ''}</span>
+                              <span className="s2a_probeStatus">{({queued: '排队中', running: '探测中', completed: '探测完成', cancelled: '已取消', expired: '已超时，未知档位保留', unavailable: '探测不可用，档位保留', aborted: '探测中止'})[probes[row.rowId]!.phase]} · {probes[row.rowId]!.requests}/{probes[row.rowId]!.maxRequests} 次请求{probes[row.rowId]!.phase === 'aborted' ? ` · 原因：${PROBE_REASONS[probes[row.rowId]!.abortReason ?? ''] ?? '原因未知'}` : ''}{['queued', 'running'].includes(probes[row.rowId]!.phase) ? ` · 预计 ${Math.ceil(probes[row.rowId]!.estimateMs / 1000)} 秒` : ''}</span>
                               {['queued', 'running'].includes(probes[row.rowId]!.phase) && <button type="button" className="s2a_btn" aria-label={`${title} ${row.id} 取消探测`} onClick={() => cancelProbe(row.rowId)}>取消</button>}
                               {probes[row.rowId]!.phase === 'completed' && hasThinkingSuggestion(probes[row.rowId]!.suggestion) && (row.fromSaved || row.reasoningEdited || row.reasoning === 'off') && <button type="button" className="s2a_btn" aria-label={`${title} ${row.id} 应用探测建议`} onClick={() => applyProbe(endpoint.rowId, row.rowId)}>应用建议</button>}
                               <span className="s2a_probeLevels">{probes[row.rowId]!.levels.map(level => <span key={level.level} title={PROBE_REASONS[level.reason] ?? '未知，保留'}>{level.level}: {({accepted: '参数已接受', unsupported: '已确认不支持', unknown: '未知，保留'})[level.state]}</span>)}</span>

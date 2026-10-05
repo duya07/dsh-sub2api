@@ -2,14 +2,31 @@
 
 [English](./README.md) | [变更记录](./CHANGELOG.md)
 
-将 [Sub2API](https://github.com/Wei-Shaw/sub2api) 网关接入 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)。这是 **duya07/dsh-sub2api** fork，基于 GodD6366 上游提交 `610ff6f26370a587223cff27449ea894ad87da96`。包名暂保持 `@godd6366/dsh-sub2api`，版本为 `0.2.1-dsh02.5`；保留包名不表示 npm 上已有此 fork 的新版本。本次交付不是 npm 发布。
+将 [Sub2API](https://github.com/Wei-Shaw/sub2api) 网关接入 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)。这是 **duya07/dsh-sub2api** fork，基于 GodD6366 上游提交 `610ff6f26370a587223cff27449ea894ad87da96`。包名暂保持 `@godd6366/dsh-sub2api`，版本为 `0.2.1-dsh02.7`；保留包名不表示 npm 上已有此 fork 的新版本。本次交付不是 npm 发布。
+
+## 相较上游的更新点
+
+对比上游 `GodD6366/dsh-sub2api` 提交 `610ff6f`：
+
+1. **适配 DSH 0.2.0-rc.2。** 上游调用已被移除的 `settings.installSection`；本 fork 改用 `settings.configure({ auto: false })`、volatile 字段和延后的启动同步。
+2. **多个独立端点与 Key**：每个端点有各自的网关地址、协议、Key 引用和模型列表，端点行可折叠。
+3. **更安全的 Key 保存**：先预检再写 Key、保存串行化，仅在确认配置“未提交”时才回滚 Key。
+4. **保守的思考档位探测**：默认关闭，全局请求间隔至少 5 秒，可取消；没有重复的明确拒绝加一次成功对照，就不会剔除任何档位。
+5. **探测中止现在可见。** 无档位对照请求失败（429、认证/额度、SDK 不可用）时，界面显示“探测中止”及原因，而不再显示“探测完成”且全部档位未知。对照遇到限流时，按网关的 `Retry-After` 等待后只重试一次（超过 10 分钟任务寿命则不等待）；401/403 绝不重试。其他对照失败仍逐档继续，且不会剔除任何档位。
+6. **Claude 平台思考修复。** anthropic-messages 路由写入 `compat.forceAdaptiveThinking: true`（可按模型用 `thinkingMode: 'budget'` 关闭）。`claude-sonnet-5-5` 等模型会拒绝宿主默认发送的 `thinking.type=enabled`（`400 ... requires adaptive thinking`）。OpenAI 路由输出不变，并有基线夹具测试保护。
+7. **可选的 `web_search` 提供方**，接入宿主 web 接口（id 为 `sub2api`，默认关闭，仅 `openai-responses` 端点可用，单次请求、无隐藏重试）。
+8. **`generate_image` 支持参考图编辑**（走 `/images/edits`，1-5 张；引用无效直接报错，不会静默降级为文生图），并修复在生图槽位选择端点路由后保存时被丢弃的问题。
+9. **端点级 `streamIdleTimeoutMs`**，适配流式响应较慢的网关。
+
+评审过其他项目但未采纳：订阅登录、账号池、额度显示、复用 Claude Code 凭据、修改默认模型、`x_search` 与视频生成。
 
 ## 已验证范围
 
 本地适配已在 **DSH 0.2.0-rc.2**、**desktop 2.0.17** 上验证，不承诺其他版本兼容。
 
-- 原适配的 136 项自动化测试及服务端、客户端类型检查通过；发布副本增加 packaging 和跨平台测试等待回归检查，合计 138 项通过。
-- 浏览器检查覆盖 192 个案例、2,320 次断言和四种视口尺寸。
+- 完整测试套件（195 项，含 packaging 与跨平台等待回归）及服务端、客户端类型检查通过；上述行为均有变异测试，移除修复后测试会变红。
+- 浏览器检查（192 个案例、2,320 次断言、四种视口尺寸）是在较早的 0.2.1-dsh02.5 构建上做的，之后新增的内容未重跑。
+- 针对真实网关，在 0.2.1-dsh02.6 构建上各验证过一次 `/images/edits` 和一次 `web_search` 请求。探测中止/重试（第 5 条）与 Claude 自适应思考修复（第 6 条）仅用 mock 传输层和宿主真实 SDK 请求构造器验证，**没有**在真实限流或 Claude 平台网关上验证。
 - Review 已完成。浏览器检查使用 mock 服务，不是生产环境完整聊天验证。
 
 网关可用性、额度、协议支持和真实思考行为取决于上游服务。
@@ -25,7 +42,7 @@ npm ci --ignore-scripts
 npm run typecheck
 npm test
 npm pack --ignore-scripts
-dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.5.tgz
+dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.7.tgz
 ```
 
 `npm test` 会先构建再测试，因此即使安装、打包时禁用了生命周期脚本，打出的包仍包含刚构建的 `lib` 产物。上述 tgz 名称来自当前包名与版本；若它们发生变化，请使用 `npm pack` 实际输出的文件名。安装后重启 DSH/desktop。若使用的不是 `desktop` profile，将命令中的 `desktop` 换成自己的 profile 名称。
