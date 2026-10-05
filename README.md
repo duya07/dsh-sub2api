@@ -24,7 +24,7 @@ Not adopted from reviewed projects: subscription logins, account pools, quota di
 
 The local adaptation was verified with **DSH 0.2.0-rc.2** and **desktop 2.0.17**. Other versions are not covered by this verification.
 
-- The full suite (195 tests, including packaging and cross-platform wait regressions) and server/client typechecks passed. Behaviors above were covered by mutation tests that fail when the fix is removed.
+- The full suite (196 tests, including packaging and cross-platform wait regressions) and server/client typechecks passed. Behaviors above were covered by mutation tests that fail when the fix is removed.
 - Browser checks (192 cases, 2,320 assertions, four viewport sizes) were run on the earlier 0.2.1-dsh02.5 build; they have not been re-run for the later additions.
 - Against a real gateway, one `/images/edits` request and one `web_search` request were each verified once on the 0.2.1-dsh02.6 build. The probe-abort/retry behavior (item 5) and the Claude adaptive-thinking fix (item 6) are verified with mocked transports and the real host SDK request builder only; they have **not** been verified against a real rate-limited or Claude-platform gateway.
 - Review was completed. Browser checks used mocked services and are not a production full-chat validation.

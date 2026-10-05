@@ -5,7 +5,7 @@
 - Reasoning probe: a failed no-effort control now ends the probe as "aborted" with a visible reason (was reported as "complete" with every level unknown); a rate-limited control is retried once after `Retry-After` (skipped beyond the 10-minute task lifetime); 401/403 are never retried; levels are never removed because of an abort.
 - Claude platform: anthropic-messages routes write `compat.forceAdaptiveThinking: true` (per-model `thinkingMode: 'budget'` opts out); OpenAI routes unchanged.
 - Added optional `web_search` provider (default off), `generate_image` reference-image editing via `/images/edits`, image-slot endpoint route persistence fix, and per-endpoint `streamIdleTimeoutMs`.
-- Verification: 195 tests plus typechecks; real-gateway checks limited to one `/images/edits` and one `web_search` request (on 0.2.1-dsh02.6). The probe-abort and Claude fixes are not verified against a real gateway.
+- Verification: 196 tests plus typechecks; real-gateway checks limited to one `/images/edits` and one `web_search` request (on 0.2.1-dsh02.6). The probe-abort and Claude fixes are not verified against a real gateway.
 
 ## 0.2.1-dsh02.5
 

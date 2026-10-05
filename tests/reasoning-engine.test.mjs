@@ -12,10 +12,19 @@ function clock() {
   let time = 10000
   return {now: () => time, advance(ms) {time += ms}, scheduler: new ProbeScheduler(() => time, async (ms, signal) => {if (signal.aborted) throw new Error('cancelled'); time += ms})}
 }
-async function settle(service, id) {
-  for (let i = 0; i < 1000; i++) {await setImmediate(); const view = service.status(id); if (!['queued', 'running'].includes(view.phase)) return view}
+async function settle(service, id, timeoutMs = 5000) {
+  const deadline = performance.now() + timeoutMs
+  while (performance.now() < deadline) {await setImmediate(); const view = service.status(id); if (!['queued', 'running'].includes(view.phase)) return view}
   assert.fail('bounded probe did not settle')
 }
+
+test('settle admits more than 1000 event-loop turns within its time bound', async () => {
+  let polls = 0
+  const service = {status() {return {phase: ++polls > 1500 ? 'completed' : 'running'}}}
+  assert.equal((await settle(service, 'fake-task')).phase, 'completed')
+  assert.equal(polls, 1501)
+  await assert.rejects(settle({status() {return {phase: 'running'}}}, 'stalled-task', 10), /bounded probe did not settle/)
+})
 
 test('no successful control means no removal, even when every candidate is explicitly rejected', async () => {
   const time = clock()
