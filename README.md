@@ -2,7 +2,7 @@
 
 [中文文档](./README.zh.md) | [Changelog](./CHANGELOG.md)
 
-Connect a [Sub2API](https://github.com/Wei-Shaw/sub2api) gateway to [DeepSeek Harness](https://github.com/deepseek-ai/dsh). This is the **duya07/dsh-sub2api** fork of GodD6366's plugin, based on upstream commit `610ff6f26370a587223cff27449ea894ad87da96`. The package identity remains `@godd6366/dsh-sub2api`, version `0.2.1-dsh02.7`; that name does not identify a new fork release on npm. This delivery is not an npm publication.
+Connect a [Sub2API](https://github.com/Wei-Shaw/sub2api) gateway to [DeepSeek Harness](https://github.com/deepseek-ai/dsh). This is the **duya07/dsh-sub2api** fork of GodD6366's plugin, based on upstream commit `610ff6f26370a587223cff27449ea894ad87da96`. The package identity remains `@godd6366/dsh-sub2api`, version `0.2.1-dsh02.9`; that name does not identify a new fork release on npm. This delivery is not an npm publication.
 
 ## Changes Relative To Upstream
 
@@ -17,6 +17,9 @@ Compared with upstream `GodD6366/dsh-sub2api` at `610ff6f`:
 7. **Optional `web_search` provider** for the host web seam (id `sub2api`, off by default, only available for `openai-responses` endpoints, one request without hidden retries).
 8. **`generate_image` reference-image editing** through `/images/edits` (1-5 references; invalid references are an error, never silently downgraded to text-to-image), and a fix so an endpoint route chosen in the image slot is saved instead of dropped.
 9. **Per-endpoint `streamIdleTimeoutMs`** for slow streaming gateways.
+10. **Probe failure reasons are visible instead of one fixed string.** The probe route no longer collapses JSON parsing, draft parsing, key resolution and probe-start failures into the single `probe request unavailable` message; it returns a short classified reason that the client shows in the probe status line. The client bounds that reason where it is stored (200 characters), not only where it is rendered, and a level that was transformed or never sent now names the wire parameter, the value observed and the expected level instead of the generic "parameter converted or not sent".
+11. **The `off` level is selectable again on Claude routes.** An adaptive anthropic route now declares `off` (wire value `null`) instead of leaving it out, because the host drops every level it does not declare from the picker: `off` used to disappear and thinking could not be turned off at all. Selecting it makes pi-ai send `thinking: { type: "disabled" }`, which is the only disable spelling an adaptive route can produce from the plugin side; whether a given deployment accepts that flag is **not** verified. OpenAI-style routes keep their verbatim `reasoning_effort` spelling and a baseline fixture pins them.
+12. **Probe levels are judged by the payload, not predicted from the model's output limit.** The probe no longer short-circuits a level to `budget-limited` when the model's own `maxTokens` exceeds the probe cap. The probe always requests `maxTokens: cap`, so the model's own limit said nothing about what the SDK would write — and on OpenAI-style routes that prediction stranded all five levels before a single request went out, because the payload writes `max_output_tokens = cap`, exactly the accepted bound. Every protocol now runs the request and `inspectProbeWire` judges the payload the SDK actually built; `budget-limited` survives only as a real payload verdict and still carries the two numbers behind it.
 
 Not adopted from reviewed projects: subscription logins, account pools, quota displays, Claude Code credential reuse, changing the default model, `x_search` and video generation.
 
@@ -24,9 +27,10 @@ Not adopted from reviewed projects: subscription logins, account pools, quota di
 
 The local adaptation was verified with **DSH 0.2.0-rc.2** and **desktop 2.0.17**. Other versions are not covered by this verification.
 
-- The full suite (196 tests, including packaging and cross-platform wait regressions) and server/client typechecks passed. Behaviors above were covered by mutation tests that fail when the fix is removed.
+- The full suite (213 tests, including packaging and cross-platform wait regressions) and server/client typechecks passed. Behaviors above were covered by mutation tests that fail when the fix is removed.
 - Browser checks (192 cases, 2,320 assertions, four viewport sizes) were run on the earlier 0.2.1-dsh02.5 build; they have not been re-run for the later additions.
 - Against a real gateway, one `/images/edits` request and one `web_search` request were each verified once on the 0.2.1-dsh02.6 build. The probe-abort/retry behavior (item 5) and the Claude adaptive-thinking fix (item 6) are verified with mocked transports and the real host SDK request builder only; they have **not** been verified against a real rate-limited or Claude-platform gateway.
+- The probe-reason visibility changes (item 10) and the `off`-level declaration (item 11) are verified offline: route and client tests plus mutation runs. The `thinking: { type: "disabled" }` flag that item 11 puts on the wire has not been checked against a real adaptive deployment, and the single captured upstream rejection in this repository concerns the fixed-budget shape, not `disabled`.
 - Review was completed. Browser checks used mocked services and are not a production full-chat validation.
 
 Gateway availability, quotas, protocol support and actual reasoning behavior depend on the upstream service.
@@ -42,7 +46,7 @@ npm ci --ignore-scripts
 npm run typecheck
 npm test
 npm pack --ignore-scripts
-dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.7.tgz
+dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.9.tgz
 ```
 
 `npm test` runs the build before the tests, so the tarball includes freshly built `lib` assets even though lifecycle scripts are disabled during install and packing. The tarball name above follows the current package name and version; use the actual filename printed by `npm pack` if they change. Restart DSH/desktop after adding the plugin. If your active profile is not `desktop`, replace `desktop` with your own profile name.

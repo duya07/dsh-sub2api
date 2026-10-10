@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1-dsh02.9
+
+- Reasoning probe: the `maxTokens > cap` short-circuit is gone for every protocol. It predicted `budget-limited` from the model's own output limit even though the probe always requests `maxTokens: cap`, so on OpenAI-style routes it stranded all five levels before a single request went out (the payload writes `max_output_tokens = cap`, which is exactly the accepted bound). Levels are now judged by the payload the SDK actually built; `budget-limited` survives as a real payload verdict and still carries the `maxTokens`/`cap` numbers the settings page renders.
+- Verification: 213 tests plus server/client typechecks, and three mutations turn the new assertions red (re-introducing the OpenAI-only exemption, short-circuiting every protocol, dropping the budget numbers).
+
+## 0.2.1-dsh02.8
+
+- Reasoning probe failures are visible: the probe route returns a short classified reason (request parsing, draft parsing, key resolution, probe start) instead of the fixed `probe request unavailable` string, and the client bounds that reason where it is stored (200 characters) rather than only where it is rendered. A level that was transformed or never sent now names the wire parameter, the observed value and the expected level instead of the generic "parameter converted or not sent".
+- Claude platform: an adaptive anthropic route declares the `off` level again (wire value `null`) so the host no longer drops it from the picker and thinking can be turned off. Selecting it makes pi-ai send `thinking: { type: "disabled" }` on the wire; whether a deployment accepts that flag is not verified, and OpenAI-style routes keep their verbatim `reasoning_effort` spelling.
+- Verification: 212 tests plus server/client typechecks. Each fix is covered by a mutation that turns its own assertions red (probe reason classification, storage-time bound, not-exact wording, `off` declaration).
+
 ## 0.2.1-dsh02.7
 
 - Reasoning probe: a failed no-effort control now ends the probe as "aborted" with a visible reason (was reported as "complete" with every level unknown); a rate-limited control is retried once after `Retry-After` (skipped beyond the 10-minute task lifetime); 401/403 are never retried; levels are never removed because of an abort.

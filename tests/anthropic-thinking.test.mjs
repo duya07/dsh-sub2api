@@ -10,13 +10,19 @@
  *
  * Current Claude deployments reject the fixed-budget shape with a 400
  * invalid_request_error ("... requires adaptive thinking or
- * thinking.type=between_tools; omit thinking or use one of those modes"), and
- * they reject `thinking: { type: "disabled" }` as well. An anthropic route
- * therefore has to (a) declare the adaptive switch, and (b) leave the `off`
- * level undeclared: the host pins undeclared levels to `null`, and pi-ai reads
- * an `off` of `null` as "send no thinking parameter at all", while an
- * explicitly declared `off` (`"none"`, or a `null` left in the map) makes it
- * send `{ type: "disabled" }`.
+ * thinking.type=between_tools; omit thinking or use one of those modes"). An
+ * anthropic route therefore has to (a) declare the adaptive switch, and (b) keep
+ * the `off` level selectable at all. (b) is not free: the host drops every level
+ * whose wire mapping is `null` from the picker
+ * (`getSupportedThinkingLevels`), so a route that leaves `off` undeclared loses
+ * the ability to turn thinking off entirely. Declaring `off` with a `null` wire
+ * value keeps it out of the host's map, which pi-ai reads as "supported", and
+ * the host then omits `reasoning` for the level (`profileOptions`: `off` ->
+ * `undefined`). On an adaptive model pi-ai turns that omission into an explicit
+ * `thinking: { type: "disabled" }` (`anthropic-messages.js`: `thinkingEnabled
+ * === false && thinkingLevelMap?.off !== null`) — that is the only spelling an
+ * adaptive route has for "off", and the wire test below pins it. Whether a
+ * given deployment accepts that flag is not verifiable offline.
  *
  * The wire assertions run pi-ai's real `streamSimple` against a recording
  * fetch, so they pin the actual request body. The openai and openai-completions
@@ -122,6 +128,22 @@ function materialize(profile, model) {
   return wire
 }
 
+/**
+ * Mirror of the host's `getSupportedThinkingLevels` (same file, L753-L761): a
+ * level mapped to `null` is dropped from the picker, a level missing from the
+ * map is offered (the `off: null` case), and `xhigh`/`max` additionally require
+ * an explicit mapping.
+ */
+function supportedLevels(wire) {
+  const map = wire.thinkingLevelMap ?? {}
+  return HOST_LEVELS.filter((level) => {
+    const mapped = map[level]
+    if (mapped === null) return false
+    if (level === 'xhigh' || level === 'max') return mapped !== undefined
+    return true
+  })
+}
+
 const ANTHROPIC_MODULE = new URL(
   '../node_modules/@earendil-works/pi-ai/dist/api/anthropic-messages.js',
   import.meta.url,
@@ -172,19 +194,20 @@ test('openai and openai-completions routes stay byte-for-byte identical', () => 
   assert.deepEqual(viaEndpoints['sub2api-openai'], baseline.endpoints['sub2api-openai'])
 })
 
-test('claude routes declare adaptive thinking and never a disabled/off level', () => {
+test('claude routes declare adaptive thinking and keep the off level selectable', () => {
   const legacy = translateToPiAi(config)
   const claude = legacy['sub2api-claude']
   assert.equal(claude.api, 'anthropic-messages')
 
   // Adaptive-aware dispatch, same base model as before the fix.
   const expected = { ...baseline.legacy['sub2api-claude'].models[0] }
-  expected.reasoningEfforts = { low: 'low', medium: 'medium', high: 'high' }
+  expected.reasoningEfforts = { low: 'low', medium: 'medium', high: 'high', off: null }
   expected.compat = { forceAdaptiveThinking: true }
   assert.deepEqual(claude.models[0], expected)
 
   const viaEndpoints = translateToPiAi(endpointConfig)
   const team = viaEndpoints['sub2api-claude-team-b'].models[0]
+  // A route that never declared `off` still offers no such level.
   assert.deepEqual(team.reasoningEfforts, { low: 'low', high: 'high' })
   assert.deepEqual(team.compat, { forceAdaptiveThinking: true })
 
@@ -253,12 +276,50 @@ test('the wire request carries adaptive thinking with the selected effort', asyn
   assert.equal(request.body.thinking?.budget_tokens, undefined)
 })
 
-test('turning thinking off sends no thinking parameter at all', async () => {
+test('an adaptive route keeps the off level in the picker by spelling it null', () => {
+  const profile = translateToPiAi(config)['sub2api-claude']
+  const model = profile.models[0]
+  // Declared, not omitted: an omitted level is what the host turns into a
+  // `null` mapping, and a `null` mapping is dropped from the picker.
+  assert.equal(model.reasoningEfforts.off, null)
+
+  const wire = materialize(profile, model)
+  assert.ok(!('off' in wire.thinkingLevelMap), 'off: null must stay out of the host map')
+  assert.ok(supportedLevels(wire).includes('off'), 'off must survive getSupportedThinkingLevels')
+  assert.deepEqual(supportedLevels(wire), ['off', 'low', 'medium', 'high'])
+
+  // The control: a route that declares no off level loses it from the picker.
+  const control = translateToPiAi(endpointConfig)['sub2api-claude-team-b']
+  const controlWire = materialize(control, control.models[0])
+  assert.equal(controlWire.thinkingLevelMap.off, null)
+  assert.ok(!supportedLevels(controlWire).includes('off'))
+
+  // An off-only anthropic model is a non-reasoning model, so it has no map.
+  const offOnly = translateToPiAi(endpointConfig)['sub2api-claude-2'].models[0]
+  assert.equal(offOnly.reasoningEfforts, false)
+
+  // The non-adaptive spellings are untouched.
+  const budget = translateToPiAi({
+    ...config,
+    providers: {
+      ...config.providers,
+      claude: {
+        apiKeyEnv: 'TEST_CLAUDE',
+        models: [{ id: 'claude-legacy', reasoningEfforts: ['none', 'high'], thinkingMode: 'budget' }],
+      },
+    },
+  })['sub2api-claude'].models[0]
+  assert.deepEqual(budget.reasoningEfforts, { off: 'none', high: 'high' })
+  const openai = translateToPiAi(config)['sub2api-openai'].models[0]
+  assert.deepEqual(openai.reasoningEfforts, { off: 'none', high: 'high', max: 'max' })
+})
+
+test('turning thinking off on an adaptive route sends an explicit disabled flag', async () => {
   const profile = translateToPiAi(config)['sub2api-claude']
   const model = materialize(profile, profile.models[0])
+  // The host selects "off" by omitting `reasoning` entirely (profileOptions).
   const request = await captureRequest(model, {})
-  assert.ok(
-    !('thinking' in request.body),
-    `thinking must be omitted when the level is off, got ${JSON.stringify(request.body.thinking)}`,
-  )
+  assert.equal(request.body.thinking?.type, 'disabled')
+  assert.equal(request.body.thinking?.budget_tokens, undefined)
+  assert.equal(request.body.output_config?.effort, undefined)
 })

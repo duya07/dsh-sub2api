@@ -309,7 +309,13 @@ for (const api of protocols) {
     assert.equal(new URL(calls[0].url).hostname, 'fake.test')
     if (api === 'openai-responses') assert.equal(calls[0].body.reasoning.effort, 'low')
     else if (api === 'openai-completions') assert.equal(calls[0].body.reasoning_effort, 'low')
-    else assert.equal(calls[0].body.thinking.budget_tokens, 2048)
+    // An anthropic probe must send the adaptive shape: the route's own
+    // translation sets forceAdaptiveThinking, so a fixed-budget probe would
+    // verify a shape the real request never uses.
+    else {
+      assert.equal(calls[0].body.thinking.type, 'adaptive')
+      assert.equal(calls[0].body.output_config.effort, 'low')
+    }
   })
   test(`actual peer ${api} keeps 200 errors, missing terminal, empty, limit and wrong-model responses unknown`, async () => {
     const error = {type: 'error', error: {message: 'fake-secret https://sensitive.test', type: 'api_error'}}
@@ -337,7 +343,7 @@ for (const api of protocols) {
   })
 }
 
-test('actual peer OpenAI xhigh/max are sent exactly when declared, while Anthropic high with a small cap is not sent', async () => {
+test('actual peer OpenAI xhigh/max are sent exactly when declared, and an anthropic level still goes out under a small model cap', async () => {
   for (const api of ['openai-responses', 'openai-completions']) for (const level of ['xhigh', 'max']) {
     let payload
     const transport = createSdkProbeTransport({fetch: async (_url, init) => {payload = JSON.parse(init.body); return sseResponse(api)}})
@@ -346,12 +352,16 @@ test('actual peer OpenAI xhigh/max are sent exactly when declared, while Anthrop
     assert.equal(api === 'openai-responses' ? payload.reasoning.effort : payload.reasoning_effort, level)
   }
   const small = probeDraft('anthropic-messages', ['high']); small.model.maxTokens = 8192
-  let calls = 0
-  const transport = createSdkProbeTransport({fetch: async () => {calls++; assert.fail('budget-clamped probe must not reach the wire')}})
+  let payload
+  const transport = createSdkProbeTransport({fetch: async (_url, init) => {payload = JSON.parse(init.body); return sseResponse('anthropic-messages')}})
   const result = await transport({draft: small, key: 'fakekey', level: 'high', signal: new AbortController().signal, sent() {}})
-  assert.equal(result.kind, 'unknown')
-  assert.equal(result.reason, 'budget-limited')
-  assert.equal(calls, 0)
+  // The adaptive shape carries no thinking budget, so a small model cap no
+  // longer makes the level unsendable; the payload proves it reached the wire.
+  assert.equal(result.kind, 'accepted')
+  assert.equal(result.transmitted, true)
+  assert.equal(payload.max_tokens, 8192)
+  assert.equal(payload.thinking.type, 'adaptive')
+  assert.equal(payload.output_config.effort, 'high')
 })
 
 test('an SDK-clamped value never reaches the fetch and cannot cause a false rejection', async () => {
@@ -365,7 +375,7 @@ test('an SDK-clamped value never reaches the fetch and cannot cause a false reje
   assert.equal(calls, 0)
 })
 
-test('R3 omitted capabilities inherit translated capacities and compressed thinking stays unknown', async () => {
+test('R3 omitted capabilities inherit translated capacities and keep the real request thinking shape', async () => {
   for (const api of protocols) {
     const draft = probeDraft(api, ['high']); draft.model = {id: 'model-a'}
     const profile = Object.values(translateToPiAi({baseURL: draft.endpoint.baseURL, providers: {openai: {}, claude: {}, grok: {}}, endpoints: [{name: 'reasoning-probe', platform: draft.endpoint.platform, baseURL: draft.endpoint.baseURL, apiKeyEnv: 'PROBE_ONLY', api, models: [{...draft.model, reasoningEfforts: draft.candidates}]}]}))[0]
@@ -382,36 +392,102 @@ test('R3 omitted capabilities inherit translated capacities and compressed think
     const transport = createSdkProbeTransport({loadSdk: async () => ({streamSimple(model, context, options) {forwarded.push(Object.hasOwn(options, 'maxTokens')); return sdk.streamSimple(model, context, options)}}), fetch: async (_url, init) => {bodies.push(JSON.parse(init.body)); return sseResponse(api)}})
     for (const level of [undefined, 'high']) {
       const result = await transport({draft, key: 'fakekey', level, signal: new AbortController().signal, sent() {}})
-      if (api === 'anthropic-messages' && level === 'high') {
-        assert.equal(result.kind, 'unknown')
-        assert.equal(result.reason, 'budget-limited')
-        assert.equal(result.transmitted, false)
-      } else assert.equal(result.kind, 'accepted')
+      assert.equal(result.kind, 'accepted')
     }
     const tokens = body => api === 'openai-responses' ? body.max_output_tokens : api === 'openai-completions' ? body.max_completion_tokens ?? body.max_tokens : body.max_tokens
     assert.deepEqual(forwarded, [false, false])
     assert.equal(tokens(normalBody), 8192)
     assert.equal(tokens(bodies[0]), 8192)
     if (api === 'anthropic-messages') {
-      assert.equal(normalBody.thinking.budget_tokens, 7168)
-      assert.equal(bodies.length, 1)
+      // The real request and the probe now both send adaptive thinking, so the
+      // small inherited cap changes max_tokens only, never the thinking shape.
+      assert.equal(normalBody.thinking.type, 'adaptive')
+      assert.equal(normalBody.output_config.effort, 'high')
+      assert.equal(bodies.length, 2)
+      assert.equal(bodies[1].thinking.type, 'adaptive')
+      assert.equal(bodies[1].output_config.effort, 'high')
     } else assert.equal(tokens(bodies[1]), 8192)
     assert.equal(bodies.every(body => tokens(body) <= tokens(normalBody)), true)
   }
 })
 
-test('a deliberately reduced explicit output cap cannot reject a candidate level', async () => {
-  const draft = probeDraft('openai-responses', ['high']); draft.model.maxTokens = 65536
+test('the probe model carries the translated anthropic compat so the wire shape matches the real request', () => {
+  for (const api of protocols) {
+    const wire = probeWireModel(probeDraft(api))
+    assert.equal(wire.compat?.forceAdaptiveThinking === true, api === 'anthropic-messages', `${api} probe compat: ${JSON.stringify(wire.compat)}`)
+  }
+})
+
+test('an anthropic model declaring more output than the probe cap still probes every level on the wire', async () => {
+  const draft = probeDraft('anthropic-messages', ['low', 'high']); draft.model.maxTokens = 131072
+  const bodies = []
+  const transport = createSdkProbeTransport({fetch: async (_url, init) => {bodies.push(JSON.parse(init.body)); return sseResponse('anthropic-messages')}})
+  for (const level of ['low', 'high']) {
+    const result = await transport({draft, key: 'fakekey', level, signal: new AbortController().signal, sent() {}})
+    assert.equal(result.kind, 'accepted')
+    assert.equal(result.transmitted, true)
+  }
+  assert.deepEqual(bodies.map(body => body.output_config.effort), ['low', 'high'])
+})
+
+// The probe always asks for `maxTokens: cap`, so a model whose own maxTokens is
+// larger says nothing about the payload. Predicting "budget-limited" from that
+// number stranded every openai level before a request went out; the SDK's own
+// payload is the only thing that decides now, for every protocol.
+test('an openai model declaring more output than the probe cap still sends every level on the wire', async () => {
+  for (const api of ['openai-responses', 'openai-completions']) {
+    const draft = probeDraft(api, ['low', 'medium', 'high', 'xhigh', 'max']); draft.model.maxTokens = 128000
+    const bodies = []
+    const transport = createSdkProbeTransport({fetch: async (_url, init) => {bodies.push(JSON.parse(init.body)); return sseResponse(api)}})
+    for (const level of draft.candidates) {
+      const result = await transport({draft, key: 'fakekey', level, signal: new AbortController().signal, sent() {}})
+      assert.equal(result.kind, 'accepted', `${api} ${level}: ${JSON.stringify(result)}`)
+      assert.equal(result.transmitted, true, `${api} ${level} reached the wire`)
+    }
+    assert.deepEqual(bodies.map(body => api === 'openai-responses' ? body.reasoning.effort : body.reasoning_effort), ['low', 'medium', 'high', 'xhigh', 'max'])
+    assert.equal(bodies.every(body => (api === 'openai-responses' ? body.max_output_tokens : body.max_completion_tokens ?? body.max_tokens) === 32768), true)
+  }
+  const draft = probeDraft('openai-responses', ['low', 'medium', 'high', 'xhigh', 'max']); draft.model.maxTokens = 128000
+  const time = clock(); let calls = 0
+  const service = new ReasoningProbeService(createSdkProbeTransport({fetch: async () => {calls++; return sseResponse('openai-responses')}}), time.scheduler, time.now)
+  try {
+    const view = await settle(service, service.start(draft, 'fakekey').id)
+    assert.equal(calls, 6, 'one control plus all five levels reach the wire')
+    assert.deepEqual(view.levels.map(item => item.state), ['accepted', 'accepted', 'accepted', 'accepted', 'accepted'])
+    assert.equal(view.levels.some(item => item.reason === 'budget-limited'), false)
+  } finally {service.dispose()}
+})
+
+// The exemption must not be re-introduced one protocol at a time: every route
+// now reaches the SDK when the model declares more output than the probe cap,
+// and each one counts its request as sent.
+test('no protocol is exempt from the payload verdict when the model declares more output than the cap', async () => {
+  for (const api of protocols) {
+    const draft = probeDraft(api, ['high']); draft.model.maxTokens = 131072
+    let sends = 0
+    const transport = createSdkProbeTransport({fetch: async () => sseResponse(api)})
+    const result = await transport({draft, key: 'fakekey', level: 'high', signal: new AbortController().signal, sent() {sends++}})
+    assert.equal(result.transmitted, true, `${api} reached the wire`)
+    assert.equal(sends, 1, `${api} counted its request as sent`)
+  }
+})
+
+// budget-limited is no longer predicted from the model's own maxTokens: it is
+// what inspectProbeWire reports when the payload the SDK actually built exceeds
+// the probe cap. The verdict still carries the two numbers the UI renders.
+test('budget-limited now comes from the payload and still carries the numbers behind it', async () => {
+  const draft = probeDraft('openai-responses', ['high']); draft.model.maxTokens = 128000
   const sdk = await loadPeerProbeSdk('openai-responses')
   let calls = 0
-  const transport = createSdkProbeTransport({loadSdk: async () => sdk, fetch: async (_url, init) => {calls++; const body = JSON.parse(init.body); return body.reasoning?.effort ? new Response(JSON.stringify({error: {param: 'reasoning.effort', code: 'unsupported_value', message: "unsupported value 'high'"}}), {status: 400}) : sseResponse('openai-responses')}})
+  const transport = createSdkProbeTransport({loadSdk: async () => ({streamSimple(model, context, options) {return sdk.streamSimple(model, context, 'reasoning' in options ? {...options, maxTokens: 65536} : options)}}), fetch: async () => {calls++; return sseResponse('openai-responses')}})
   const time = clock(), service = new ReasoningProbeService(transport, time.scheduler, time.now)
   try {
     const view = await settle(service, service.start(draft,'fakekey').id)
-    assert.deepEqual(view.suggestion, ['high'])
     assert.equal(view.levels[0].state, 'unknown')
     assert.equal(view.levels[0].reason, 'budget-limited')
-    assert.equal(calls, 1)
+    assert.equal(view.levels[0].maxTokens, 128000)
+    assert.equal(view.levels[0].cap, 32768)
+    assert.equal(calls, 1, 'only the no-level control request goes out')
   } finally {service.dispose()}
 })
 
@@ -429,4 +505,41 @@ test('oversized and abort-stalled HTTP error bodies are bounded and never passed
   const result = await pending
   assert.equal(result.kind, 'unknown')
   assert.equal(result.reason, 'cancelled')
+})
+
+// F3 red test: "参数被转换或未发送" says neither what the SDK actually sent nor
+// what the level expected, so a not-exact verdict carries both whenever the wire
+// payload was readable.
+test('a not-exact verdict carries the wire parameter and the value that went out', () => {
+  const responses = inspectProbeWire('openai-responses', 'high', {reasoning: {effort: 'low'}, max_output_tokens: 32768}, 32768)
+  assert.equal(responses.exact, false)
+  assert.equal(responses.reason, 'parameter-not-exact')
+  assert.equal(responses.parameter, 'reasoning.effort')
+  assert.equal(responses.value, 'low')
+  const completions = inspectProbeWire('openai-completions', 'high', {max_tokens: 32768}, 32768)
+  assert.equal(completions.parameter, 'reasoning_effort')
+  assert.equal(completions.value, undefined, 'an omitted parameter has no value to name')
+  const adaptive = inspectProbeWire('anthropic-messages', 'high', {thinking: {type: 'adaptive'}, output_config: {effort: 'medium'}, max_tokens: 32768}, 32768)
+  assert.equal(adaptive.parameter, 'output_config.effort')
+  assert.equal(adaptive.value, 'medium')
+  const fixed = inspectProbeWire('anthropic-messages', 'high', {thinking: {type: 'disabled'}, max_tokens: 32768}, 32768)
+  assert.equal(fixed.parameter, 'thinking.type')
+  assert.equal(fixed.value, 'disabled')
+  // The added detail must never turn a not-exact wire into rejection evidence.
+  assert.equal(classifyProbeError(400, {error: {param: 'reasoning.effort', message: "unsupported value 'low'"}}, responses).kind, 'unknown')
+  assert.equal(classifyProbeError(400, {error: {param: 'reasoning.effort', message: "unsupported value 'low'"}}, responses).reason, 'ambiguous-error')
+})
+
+test('the service carries a not-exact parameter and value from the transport into the level', async () => {
+  const time = clock()
+  const transport = async ({level}) => level === undefined
+    ? accepted
+    : {kind: 'unknown', reason: 'parameter-not-exact', transmitted: false, parameter: 'reasoning.effort', value: 'low'}
+  const service = new ReasoningProbeService(transport, time.scheduler, time.now)
+  try {
+    const view = await settle(service, service.start(probeDraft('openai-responses', ['high']), 'fakekey').id)
+    assert.equal(view.levels[0].reason, 'parameter-not-exact')
+    assert.equal(view.levels[0].parameter, 'reasoning.effort')
+    assert.equal(view.levels[0].value, 'low')
+  } finally {service.dispose()}
 })

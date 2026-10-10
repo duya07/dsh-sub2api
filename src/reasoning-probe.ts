@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { translateToPiAi } from './pi-ai.ts'
+import { translateToPiAi, type PiAiModelProfile } from './pi-ai.ts'
 import { API_PROTOCOLS, type ApiProtocol, type Config, type ProviderKey } from './index.ts'
 
 export const PROBE_GAP_MS = 5000
@@ -17,12 +17,14 @@ export interface ProbeDraft {
   model: { id: string; contextWindow?: number; maxTokens?: number }
   candidates: ProbeLevel[]
 }
-export interface ProbeLevelResult { level: ProbeLevel; state: 'accepted' | 'unsupported' | 'unknown'; reason: ProbeReason }
+export interface ProbeLevelResult { level: ProbeLevel; state: 'accepted' | 'unsupported' | 'unknown'; reason: ProbeReason; maxTokens?: number; cap?: number; parameter?: string; value?: string }
 export interface ProbeView {
   id: string
   phase: 'queued' | 'running' | 'completed' | 'aborted' | 'cancelled' | 'expired'
   /** Set only when the no-level control attempt ended the batch before any level was probed. */
   abortReason?: ProbeReason
+  /** Set by the client when the batch never started. Aborted and unavailable are different outcomes. */
+  unavailableReason?: string
   requests: number
   maxRequests: number
   minGapMs: number
@@ -30,7 +32,7 @@ export interface ProbeView {
   levels: ProbeLevelResult[]
   suggestion: ProbeLevel[]
 }
-export interface AttemptResult { kind: 'accepted' | 'rejected' | 'unknown'; reason: ProbeReason; transmitted: boolean; retryAfterMs?: number; retryAfterUntil?: number }
+export interface AttemptResult { kind: 'accepted' | 'rejected' | 'unknown'; reason: ProbeReason; transmitted: boolean; retryAfterMs?: number; retryAfterUntil?: number; maxTokens?: number; cap?: number; parameter?: string; value?: string }
 export interface ProbeAttempt { draft: ProbeDraft; key: string; level?: ProbeLevel; signal: AbortSignal; sent: () => void; now?: () => number; pauseUntil?: (until: number) => void }
 export type ProbeTransport = (attempt: ProbeAttempt) => Promise<AttemptResult>
 
@@ -192,6 +194,10 @@ export class ReasoningProbeService {
         if (task.controller.signal.aborted) return
         if (first.kind === 'accepted' && first.transmitted) { result.state = 'accepted'; result.reason = 'accepted-parameter'; continue }
         result.reason = first.reason
+        if (first.maxTokens !== undefined) result.maxTokens = first.maxTokens
+        if (first.cap !== undefined) result.cap = first.cap
+        if (first.parameter !== undefined) result.parameter = first.parameter
+        if (first.value !== undefined) result.value = first.value
         if (first.kind !== 'rejected' || !first.transmitted) continue
         const rejectedAt = this.now()
         // A fresh same-context control prevents an unrelated failure from removing a level.
@@ -218,7 +224,10 @@ export class ReasoningProbeService {
   }
 }
 
-interface WireModel { id: string; name: string; api: ApiProtocol; provider: string; baseUrl: string; reasoning: boolean; thinkingLevelMap: Record<string, string | null>; input: string[]; cost: {input: number; output: number; cacheRead: number; cacheWrite: number}; contextWindow: number; maxTokens: number }
+// `compat` is not decoration: pi-ai selects the anthropic thinking shape from
+// the model alone, so a probe model built without it silently probes a wire
+// shape the real route never sends.
+interface WireModel { id: string; name: string; api: ApiProtocol; provider: string; baseUrl: string; reasoning: boolean; thinkingLevelMap: Record<string, string | null>; input: string[]; cost: {input: number; output: number; cacheRead: number; cacheWrite: number}; contextWindow: number; maxTokens: number; compat?: PiAiModelProfile['compat'] }
 interface SdkStream { result: () => Promise<{stopReason?: string; content?: {type: string; text?: string}[]}> }
 type SdkModule = {streamSimple: (model: WireModel, context: unknown, options: Record<string, unknown>) => SdkStream}
 export type SdkLoader = (api: ApiProtocol) => Promise<SdkModule>
@@ -251,16 +260,33 @@ export function probeWireModel(draft: ProbeDraft): WireModel {
     const value = efforts && typeof efforts === 'object' ? efforts[level as keyof typeof efforts] : undefined
     if (value !== null) map[level] = value ?? null
   }
-  return {id: model.id, name: model.name ?? model.id, api: profile.api as ApiProtocol, provider: route, baseUrl: profile.baseURL!, input: model.input ?? ['text'], cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}, contextWindow: model.contextWindow ?? profile.defaultContextWindow!, maxTokens: model.maxTokens ?? profile.defaultMaxTokens!, reasoning: true, thinkingLevelMap: map}
+  // The translated profile already decided the wire shape (translateModel sets
+  // `compat.forceAdaptiveThinking` for anthropic routes); this hand-built
+  // literal is the last step before the SDK, so dropping the field here would
+  // undo that decision and probe the fixed-budget shape instead.
+  return {id: model.id, name: model.name ?? model.id, api: profile.api as ApiProtocol, provider: route, baseUrl: profile.baseURL!, input: model.input ?? ['text'], cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}, contextWindow: model.contextWindow ?? profile.defaultContextWindow!, maxTokens: model.maxTokens ?? profile.defaultMaxTokens!, reasoning: true, thinkingLevelMap: map, compat: model.compat}
 }
 
 interface ExactWire { exact: boolean; reason: ProbeReason; parameter?: string; value?: string }
+// A parameter-not-exact verdict only says "the parameter did not survive the SDK".
+// That is not actionable on its own, so whenever the wire payload was readable
+// the verdict also carries the parameter name and the value that actually went
+// out, and the settings page can state the difference instead of guessing.
+function notExact(parameter?: string, value?: unknown): ExactWire {
+  const sent = typeof value === 'string' ? value : value === undefined ? undefined : JSON.stringify(value) ?? String(value)
+  return {
+    exact: false,
+    reason: 'parameter-not-exact',
+    ...(parameter === undefined ? {} : { parameter }),
+    ...(sent === undefined ? {} : { value: sent }),
+  }
+}
 export function inspectProbeWire(api: ApiProtocol, level: ProbeLevel | undefined, payload: Record<string, unknown>, cap: number): ExactWire {
   if (level === undefined) return {exact: true, reason: 'accepted-parameter'}
   if (api === 'openai-responses' || api === 'openai-completions') {
     const parameter = api === 'openai-responses' ? 'reasoning.effort' : 'reasoning_effort'
     const value = api === 'openai-responses' ? object(payload.reasoning)?.effort : payload.reasoning_effort
-    if (value !== level || level === 'off') return {exact: false, reason: 'parameter-not-exact'}
+    if (value !== level || level === 'off') return notExact(parameter, value)
     const tokens = api === 'openai-responses' ? payload.max_output_tokens : payload.max_completion_tokens ?? payload.max_tokens
     if (typeof tokens !== 'number' || tokens < 1024 || tokens > cap) return {exact: false, reason: 'budget-limited'}
     return {exact: true, reason: 'accepted-parameter', parameter, value: level}
@@ -272,12 +298,12 @@ export function inspectProbeWire(api: ApiProtocol, level: ProbeLevel | undefined
     // Mid-conversation effort uses a system message while forcing wire effort to high.
     if (Array.isArray(payload.messages) && payload.messages.some(message => object(message)?.role === 'system')) return {exact: false, reason: 'parameter-not-exact'}
     const effort = object(payload.output_config)?.effort
-    if (effort !== level) return {exact: false, reason: 'parameter-not-exact'}
+    if (effort !== level) return notExact('output_config.effort', effort)
     return {exact: true, reason: 'accepted-parameter', parameter: 'output_config.effort', value: level}
   }
   const budgets: Partial<Record<ProbeLevel, number>> = {minimal: 1024, low: 2048, medium: 8192, high: 16384}
   const budget = budgets[level]
-  if (!budget || thinking?.type !== 'enabled') return {exact: false, reason: 'parameter-not-exact'}
+  if (!budget || thinking?.type !== 'enabled') return notExact('thinking.type', thinking?.type)
   if (thinking.budget_tokens !== budget || typeof payload.max_tokens !== 'number' || payload.max_tokens < budget + 1024 || payload.max_tokens > cap) return {exact: false, reason: 'budget-limited'}
   // Budgets encode the host's level but an error about numeric tokens cannot reject an effort enum.
   return {exact: true, reason: 'accepted-parameter'}
@@ -385,7 +411,15 @@ export function createSdkProbeTransport(options: {fetch?: typeof fetch; loadSdk?
     let sdk: SdkModule
     try {sdk = await (options.loadSdk ?? loadPeerProbeSdk)(draft.endpoint.api)} catch {return {kind: 'unknown', reason: 'sdk-unavailable', transmitted: false}}
     const model = probeWireModel(draft), cap = Math.min(model.maxTokens, 32768)
-    if (level !== undefined && model.maxTokens > cap) return {kind: 'unknown', reason: 'budget-limited', transmitted: false}
+    // Predicting a budget conclusion from the model's own maxTokens was wrong
+    // for every protocol, so nothing is short-circuited here any more. The
+    // probe always asks for `maxTokens: cap`, and what reaches the wire is the
+    // SDK's own arithmetic on top of that: an anthropic model adds its thinking
+    // budget to max_tokens and clamps the result to its own cap, while an
+    // openai-family model writes max_output_tokens = the cap it was given.
+    // maxTokens > cap therefore implies nothing about the payload, and guessing
+    // "budget-limited" from it stranded all five levels before a single request
+    // went out. inspectProbeWire judges the payload the SDK actually built.
     let outcome: AttemptResult | undefined, transmitted = false, calls = 0
     let pause: Pick<AttemptResult, 'retryAfterMs' | 'retryAfterUntil'> = {}
     const evidence: StreamEvidence = {terminal: false, stopped: false, model: false, error: false, text: false}
@@ -394,7 +428,13 @@ export function createSdkProbeTransport(options: {fetch?: typeof fetch; loadSdk?
       let payload: Record<string, unknown> | undefined
       try {payload = object(JSON.parse(String(init?.body ?? '')))} catch { /* Missing JSON is not verifiable. */ }
       const exact = payload ? inspectProbeWire(model.api, level, payload, cap) : {exact: false, reason: 'parameter-not-exact' as const}
-      if (!exact.exact || payload?.model !== model.id) {outcome = {kind: 'unknown', reason: exact.reason, transmitted: false}; throw new Error('parameter-not-exact')}
+      // Carry the two numbers the verdict was computed from, so the UI can state
+      // why a level never went out instead of only naming the reason.
+      const budget = exact.reason === 'budget-limited' ? {maxTokens: model.maxTokens, cap} : {}
+      // A not-exact verdict carries the wire parameter and the value that went
+      // out, so the level can be rendered with the difference it observed.
+      const mismatch = exact.reason === 'parameter-not-exact' ? {parameter: exact.parameter, value: exact.value} : {}
+      if (!exact.exact || payload?.model !== model.id) {outcome = {kind: 'unknown', reason: exact.reason, transmitted: false, ...budget, ...mismatch}; throw new Error('parameter-not-exact')}
       transmitted = true; sent()
       const response = await (options.fetch ?? fetch)(input, {...init, signal: AbortSignal.any([signal, ...(init?.signal ? [init.signal] : [])])})
       if (!response.ok) {

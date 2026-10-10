@@ -563,3 +563,134 @@ for (const [abortReason, hint] of [['rate-limited', '限流'], ['auth-or-quota',
     } finally {await p.close()}
   })
 }
+
+// A3 red test: a level that never left the client must say so where the user
+// reads it, not only in a hover title that reads as a bare "未知，保留".
+test('a locally held-back level states why in the visible level list instead of only in a tooltip', async () => {
+  const p = await page({status: body => ({id: body.id, phase: 'completed', requests: 1, maxRequests: 16, minGapMs: 5000, levels: [{level: 'low', state: 'unknown', reason: 'budget-limited'}], suggestion: ['low']})})
+  try {
+    await p.expand(); await p.details()
+    await p.click(p.field('Team A model-a 探测档位'))
+    for (let i = 0; i < 10; i++) await act(async () => {})
+    const levels = p.view.root.findAllByProps({className: 's2a_probeLevels'})[0]
+    assert.ok(levels, 'the per-level list is rendered')
+    // React elements carry a circular fiber owner, so collect the rendered text
+    // itself instead of serializing the node tree.
+    const flat = node => Array.isArray(node) ? node.map(flat).join('') : typeof node === 'string' ? node : node?.props ? flat(node.props.children) : ''
+    const text = flat(levels.props.children)
+    assert.ok(text.includes('该档未发出'), `the level list states that the level never left the client: ${text}`)
+    assert.ok(text.includes('预算或输出上限不足'), `the level list names the reason: ${text}`)
+  } finally {await p.close()}
+})
+
+const flatText = node => Array.isArray(node) ? node.map(flatText).join('') : typeof node === 'string' || typeof node === 'number' ? String(node) : node?.props ? flatText(node.props.children) : ''
+
+// R1 red test: a budget verdict without its two numbers cannot be acted on.
+test('a budget-limited level names the model cap and the probe cap behind its verdict', async () => {
+  const p = await page({status: body => ({id: body.id, phase: 'completed', requests: 1, maxRequests: 16, minGapMs: 5000, levels: [{level: 'low', state: 'unknown', reason: 'budget-limited', maxTokens: 131072, cap: 32768}], suggestion: ['low']})})
+  try {
+    await p.expand(); await p.details()
+    await p.click(p.field('Team A model-a 探测档位'))
+    for (let i = 0; i < 10; i++) await act(async () => {})
+    const levels = p.view.root.findAllByProps({className: 's2a_probeLevels'})[0]
+    assert.ok(levels, 'the per-level list is rendered')
+    const text = flatText(levels.props.children)
+    assert.ok(text.includes('该档未发出'), `the level list states that the level never left the client: ${text}`)
+    assert.ok(text.includes('maxTokens=131072'), `the level list names the model cap: ${text}`)
+    assert.ok(text.includes('32768'), `the level list names the probe cap: ${text}`)
+  } finally {await p.close()}
+})
+
+// R2 red test: a batch that never started must keep the failure message in the
+// status line, bounded so an oversized upstream error body cannot break it.
+test('an unavailable probe states the failure message in the status line and bounds it', async () => {
+  const message = `${'上游错误 '.repeat(60)}TAIL-MARKER`
+  const p = await page({status: () => {throw new Error(message)}})
+  try {
+    await p.expand(); await p.details()
+    await p.click(p.field('Team A model-a 探测档位'))
+    for (let i = 0; i < 10; i++) await act(async () => {})
+    const status = p.view.root.findAllByProps({className: 's2a_probeStatus'})[0]
+    assert.ok(status, 'the probe status line is rendered')
+    const text = flatText(status.props.children)
+    assert.ok(text.includes('探测不可用'), `the status line names the outcome: ${text}`)
+    const at = text.indexOf('原因：')
+    assert.ok(at >= 0, `the status line states why the batch never started: ${text}`)
+    const shown = text.slice(at + 3)
+    assert.ok(shown.length <= 200, `the failure message is bounded, got ${shown.length}`)
+    assert.equal(shown.includes('TAIL-MARKER'), false, `the tail of an oversized error is dropped: ${shown.slice(-40)}`)
+  } finally {await p.close()}
+})
+
+// The bounded message must not replace the plain wording when nothing failed.
+test('an unavailable probe without a message keeps the existing fixed wording', async () => {
+  const p = await page({status: body => ({id: body.id, phase: 'unavailable', requests: 0, maxRequests: 4, minGapMs: 5000, levels: [{level: 'high', state: 'unknown', reason: 'queued'}], suggestion: ['high']})})
+  try {
+    await p.expand(); await p.details()
+    await p.click(p.field('Team A model-a 探测档位'))
+    for (let i = 0; i < 10; i++) await act(async () => {})
+    const status = p.view.root.findAllByProps({className: 's2a_probeStatus'})[0]
+    assert.ok(status, 'the probe status line is rendered')
+    const text = flatText(status.props.children)
+    assert.ok(text.includes('探测不可用，档位保留'), `the fixed wording is kept: ${text}`)
+    assert.equal(text.includes('原因：'), false, `an empty message adds no reason fragment: ${text}`)
+  } finally {await p.close()}
+})
+
+// F2 red test: the 200-character bound used to live only in the renderer, so the
+// whole upstream message sat in React state until something read it. The bound now
+// applies where the value is stored, so the renderer passes the stored value
+// through untouched and the rendered reason *is* the stored reason.
+test('the unavailable reason is bounded where it is stored, not where it is rendered', async () => {
+  const message = `${'上游错误 '.repeat(60)}TAIL-MARKER`
+  const p = await page({status: () => {throw new Error(message)}})
+  try {
+    await p.expand(); await p.details()
+    await p.click(p.field('Team A model-a 探测档位'))
+    for (let i = 0; i < 10; i++) await act(async () => {})
+    const status = p.view.root.findAllByProps({className: 's2a_probeStatus'})[0]
+    assert.ok(status, 'the probe status line is rendered')
+    const text = flatText(status.props.children)
+    const at = text.indexOf('原因：')
+    assert.ok(at >= 0, `the status line states why the batch never started: ${text}`)
+    const shown = text.slice(at + 3)
+    assert.equal(shown, `${message.slice(0, 199)}…`, `the stored reason is truncated at write time, got ${shown.length} characters`)
+    assert.equal(shown.length, 200)
+    assert.equal(shown.includes('TAIL-MARKER'), false, `the tail of an oversized error is dropped: ${shown.slice(-40)}`)
+  } finally {await p.close()}
+})
+
+// F3 red test: "参数被转换或未发送" alone cannot be acted on; the level must name
+// the parameter and the value that actually went out.
+test('a not-exact level names the wire parameter, the value it observed and the expected level', async () => {
+  const p = await page({status: body => ({id: body.id, phase: 'completed', requests: 1, maxRequests: 16, minGapMs: 5000, levels: [{level: 'high', state: 'unknown', reason: 'parameter-not-exact', parameter: 'reasoning.effort', value: 'low'}, {level: 'low', state: 'unknown', reason: 'parameter-not-exact'}], suggestion: ['high']})})
+  try {
+    await p.expand(); await p.details()
+    await p.click(p.field('Team A model-a 探测档位'))
+    for (let i = 0; i < 10; i++) await act(async () => {})
+    const levels = p.view.root.findAllByProps({className: 's2a_probeLevels'})[0]
+    assert.ok(levels, 'the per-level list is rendered')
+    const text = flatText(levels.props.children)
+    assert.ok(text.includes('该档未发出'), `the level list states that the level never left the client: ${text}`)
+    assert.ok(text.includes('reasoning.effort=low'), `the level list names the parameter and the value that went out: ${text}`)
+    assert.ok(text.includes('期望档位 high'), `the level list names the expected level: ${text}`)
+    assert.ok(text.includes('参数被转换或未发送'), `a level with no observable wire data keeps the generic hint: ${text}`)
+  } finally {await p.close()}
+})
+
+// F1 red test: the reason the route now states must survive to the status line
+// instead of being flattened back into the bare fixed string.
+test('the server reason for a probe that never started reaches the status line', async () => {
+  const reason = 'probe request unavailable: 端点「OWN_A」已保存的 key 无法解析，请在设置中重新填写并保存后再探测'
+  const p = await page({start: () => ({httpStatus: 400, error: reason})})
+  try {
+    await p.expand(); await p.details()
+    await p.click(p.field('Team A model-a 探测档位'))
+    for (let i = 0; i < 10; i++) await act(async () => {})
+    const status = p.view.root.findAllByProps({className: 's2a_probeStatus'})[0]
+    assert.ok(status, 'the probe status line is rendered')
+    const text = flatText(status.props.children)
+    assert.ok(text.includes('探测不可用，档位保留'), `the status line names the outcome: ${text}`)
+    assert.ok(text.includes(reason), `the status line repeats the server reason verbatim: ${text}`)
+  } finally {await p.close()}
+})

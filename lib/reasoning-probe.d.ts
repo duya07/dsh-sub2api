@@ -1,3 +1,4 @@
+import { type PiAiModelProfile } from './pi-ai.js';
 import { type ApiProtocol, type ProviderKey } from './index.js';
 export declare const PROBE_GAP_MS = 5000;
 export declare const PROBE_LEVELS: readonly ["off", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -22,12 +23,18 @@ export interface ProbeLevelResult {
     level: ProbeLevel;
     state: 'accepted' | 'unsupported' | 'unknown';
     reason: ProbeReason;
+    maxTokens?: number;
+    cap?: number;
+    parameter?: string;
+    value?: string;
 }
 export interface ProbeView {
     id: string;
     phase: 'queued' | 'running' | 'completed' | 'aborted' | 'cancelled' | 'expired';
     /** Set only when the no-level control attempt ended the batch before any level was probed. */
     abortReason?: ProbeReason;
+    /** Set by the client when the batch never started. Aborted and unavailable are different outcomes. */
+    unavailableReason?: string;
     requests: number;
     maxRequests: number;
     minGapMs: number;
@@ -41,6 +48,10 @@ export interface AttemptResult {
     transmitted: boolean;
     retryAfterMs?: number;
     retryAfterUntil?: number;
+    maxTokens?: number;
+    cap?: number;
+    parameter?: string;
+    value?: string;
 }
 export interface ProbeAttempt {
     draft: ProbeDraft;
@@ -101,6 +112,7 @@ interface WireModel {
     };
     contextWindow: number;
     maxTokens: number;
+    compat?: PiAiModelProfile['compat'];
 }
 interface SdkStream {
     result: () => Promise<{

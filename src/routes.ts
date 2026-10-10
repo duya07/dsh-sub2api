@@ -103,6 +103,20 @@ function safeMessage(error: unknown): string {
   }
 }
 
+// A probe request failure used to collapse into one fixed English string, so the
+// settings page could only ever say "probe request unavailable" no matter what
+// actually went wrong. Errors this module authors carry a reason the user can
+// act on; anything else stays generic, because an upstream message can echo the
+// credential or the URL that produced it.
+const PROBE_UNAVAILABLE = 'probe request unavailable'
+class ProbeRequestError extends Error {}
+
+function probeRequestReason(error: unknown): string {
+  if (error instanceof ProbeRequestError) return `${PROBE_UNAVAILABLE}: ${error.message}`
+  if (error instanceof SyntaxError) return `${PROBE_UNAVAILABLE}: request body is not valid JSON`
+  return PROBE_UNAVAILABLE
+}
+
 function readProviderConfig(config: Config): ConfigPayload {
   const providers: ConfigPayload['providers'] = {}
   for (const def of PROVIDERS) {
@@ -346,20 +360,23 @@ async function resolveProbeKey(
   if (typeof storedRef === 'string' && storedRef.length > 0) {
     try {
       return await routes.resolveApiKey(storedRef, { apiKeyEnv: storedRef })
-    } catch (error) {
-      throw new Error(`无法使用该端点已保存的 key（${storedRef}）：${safeMessage(error)}`)
+    } catch {
+      // The upstream text is never repeated back: it can quote the credential or
+      // the URL that rejected it, and the user only needs to know which row and
+      // what to do about it.
+      throw new ProbeRequestError(`端点「${storedRef}」已保存的 key 无法解析，请在设置中重新填写并保存后再探测`)
     }
   }
-  if (!isProviderKey(provider)) throw new Error('provider 无效，应为 openai / claude / grok')
+  if (!isProviderKey(provider)) throw new ProbeRequestError('provider 无效，应为 openai / claude / grok')
   const def = PROVIDERS.find((entry) => entry.key === provider)
   const profile = routes.config().providers[provider]
   if (profile?.apiKeyEnv === undefined) {
-    throw new Error(`${def?.label ?? provider} 未配置 API key：请先填写 key 并保存配置，再获取模型/查看用量`)
+    throw new ProbeRequestError(`${def?.label ?? provider} 未配置 API key：请先填写 key 并保存配置，再获取模型/查看用量`)
   }
   try {
     return await routes.resolveApiKey(`sub2api-${provider}`, profile)
-  } catch (error) {
-    throw new Error(`无法使用已保存的 ${def?.label ?? provider} key：${safeMessage(error)}`)
+  } catch {
+    throw new ProbeRequestError(`${def?.label ?? provider} 已保存的 key 无法解析，请在设置中重新填写并保存后再试`)
   }
 }
 
@@ -396,7 +413,7 @@ export function registerRoutes(ctx: Context, routes: RouteContext): void {
           const id = body !== null && typeof body === 'object' && 'id' in body && typeof body.id === 'string' ? body.id : ''
           const task = action === 'cancel' ? probes.cancel(id) : probes.status(id)
           return task ? json(res, 200, task) : json(res, 404, {error: 'probe task not found'})
-        } catch {return json(res, 400, {error: 'probe request unavailable'})}
+        } catch (error) {return json(res, 400, {error: probeRequestReason(error)})}
       })
     }
 

@@ -2,7 +2,7 @@
 
 [English](./README.md) | [变更记录](./CHANGELOG.md)
 
-将 [Sub2API](https://github.com/Wei-Shaw/sub2api) 网关接入 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)。这是 **duya07/dsh-sub2api** fork，基于 GodD6366 上游提交 `610ff6f26370a587223cff27449ea894ad87da96`。包名暂保持 `@godd6366/dsh-sub2api`，版本为 `0.2.1-dsh02.7`；保留包名不表示 npm 上已有此 fork 的新版本。本次交付不是 npm 发布。
+将 [Sub2API](https://github.com/Wei-Shaw/sub2api) 网关接入 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)。这是 **duya07/dsh-sub2api** fork，基于 GodD6366 上游提交 `610ff6f26370a587223cff27449ea894ad87da96`。包名暂保持 `@godd6366/dsh-sub2api`，版本为 `0.2.1-dsh02.9`；保留包名不表示 npm 上已有此 fork 的新版本。本次交付不是 npm 发布。
 
 ## 相较上游的更新点
 
@@ -17,6 +17,9 @@
 7. **可选的 `web_search` 提供方**，接入宿主 web 接口（id 为 `sub2api`，默认关闭，仅 `openai-responses` 端点可用，单次请求、无隐藏重试）。
 8. **`generate_image` 支持参考图编辑**（走 `/images/edits`，1-5 张；引用无效直接报错，不会静默降级为文生图），并修复在生图槽位选择端点路由后保存时被丢弃的问题。
 9. **端点级 `streamIdleTimeoutMs`**，适配流式响应较慢的网关。
+10. **探测失败原因可见，不再是一句固定文案。** 探测路由不再把 JSON 解析、草稿解析、Key 解析和启动探测的失败统一压成 `probe request unavailable`，而是返回分类后的短原因，由客户端显示在探测状态行。客户端在**写入存储时**就把该原因截断到 200 字符（而非只在渲染时截断）；被转换或未发送的档位现在会写明线上参数名、观测到的值和期望档位，而不是笼统的“参数被转换或未发送”。
+11. **Claude 路由重新提供 `off` 档。** 自适应 anthropic 路由现在显式声明 `off`（线上值为 `null`），因为宿主会把未声明的档位从选择器里丢掉：此前 `off` 直接消失，用户无法关闭思考。选中该档时 pi-ai 会发出 `thinking: { type: "disabled" }`——这是插件侧在自适应路由上唯一能表达的“关闭”拼法；某个部署是否接受该 flag **未经验证**。OpenAI 系列路由仍写逐字 `reasoning_effort`，并有基线夹具保护。
+12. **档位结论由真实 payload 裁决，不再从模型的输出上限预测。** 当模型自身的 `maxTokens` 超过探测上限时，探测不再把该档短路成 `budget-limited`：探针请求的始终是 `maxTokens: cap`，模型自己的上限并不能说明 SDK 会写出什么；而在 OpenAI 系列路由上，这条预测会让五档在发出任何请求前就全部阵亡——实际 payload 写的是 `max_output_tokens = cap`，正好落在允许的边界上。现在所有协议都会真正发出请求，由 `inspectProbeWire` 对 SDK 构造出的 payload 裁决；`budget-limited` 只作为真实的 payload 结论存在，并且仍然带上判定所依据的两个数字。
 
 评审过其他项目但未采纳：订阅登录、账号池、额度显示、复用 Claude Code 凭据、修改默认模型、`x_search` 与视频生成。
 
@@ -24,9 +27,10 @@
 
 本地适配已在 **DSH 0.2.0-rc.2**、**desktop 2.0.17** 上验证，不承诺其他版本兼容。
 
-- 完整测试套件（196 项，含 packaging 与跨平台等待回归）及服务端、客户端类型检查通过；上述行为均有变异测试，移除修复后测试会变红。
+- 完整测试套件（213 项，含 packaging 与跨平台等待回归）及服务端、客户端类型检查通过；上述行为均有变异测试，移除修复后测试会变红。
 - 浏览器检查（192 个案例、2,320 次断言、四种视口尺寸）是在较早的 0.2.1-dsh02.5 构建上做的，之后新增的内容未重跑。
 - 针对真实网关，在 0.2.1-dsh02.6 构建上各验证过一次 `/images/edits` 和一次 `web_search` 请求。探测中止/重试（第 5 条）与 Claude 自适应思考修复（第 6 条）仅用 mock 传输层和宿主真实 SDK 请求构造器验证，**没有**在真实限流或 Claude 平台网关上验证。
+- 探测原因可见性改动（第 10 条）与 `off` 档声明（第 11 条）为离线验证：路由与客户端测试加变异运行。第 11 条会在线缆上发出 `thinking: { type: "disabled" }`，该 flag 未在真实自适应部署上验证过；本仓库唯一一次真实捕获的上游拒绝针对的是固定预算形状，不是 `disabled`。
 - Review 已完成。浏览器检查使用 mock 服务，不是生产环境完整聊天验证。
 
 网关可用性、额度、协议支持和真实思考行为取决于上游服务。
@@ -42,7 +46,7 @@ npm ci --ignore-scripts
 npm run typecheck
 npm test
 npm pack --ignore-scripts
-dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.7.tgz
+dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.9.tgz
 ```
 
 `npm test` 会先构建再测试，因此即使安装、打包时禁用了生命周期脚本，打出的包仍包含刚构建的 `lib` 产物。上述 tgz 名称来自当前包名与版本；若它们发生变化，请使用 `npm pack` 实际输出的文件名。安装后重启 DSH/desktop。若使用的不是 `desktop` profile，将命令中的 `desktop` 换成自己的 profile 名称。

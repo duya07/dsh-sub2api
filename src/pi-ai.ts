@@ -93,10 +93,9 @@ function translateReasoningEfforts(
   for (const id of ids) {
     if (id === 'none' || id === 'off') {
       // An adaptive-thinking deployment also rejects `thinking:{type:"disabled"}`,
-      // so "off" has no wire spelling worth sending on an anthropic route: the
-      // level is dropped, and the host pins the undeclared level to null, which
-      // pi-ai reads as "send no thinking parameter at all". OpenAI-style
-      // protocols keep the verbatim spelling (`reasoning_effort: "none"`).
+      // so "off" has no verbatim wire spelling worth sending on an anthropic
+      // route: `reasoning_effort: "none"` there is a 400. OpenAI-style protocols
+      // keep that spelling; an adaptive route spells the level as null below.
       declaresOff = true
       if (!adaptive) efforts.off = id === 'none' ? 'none' : 'off'
     } else if (THINKING_LEVELS.includes(id)) {
@@ -108,6 +107,18 @@ function translateReasoningEfforts(
     // off ("offers no level beyond \"off\"") and refuses an empty dict too, so
     // the model is declared as a non-reasoning one instead.
     return false
+  }
+  if (adaptive && declaresOff) {
+    // The host turns a level this dict does not carry into `null` and then drops
+    // it from the supported list, so an adaptive route that keeps other levels
+    // has to spell "off" out or the level disappears from the picker entirely.
+    // `null` is the spelling the host accepts for "off": the level stays absent
+    // from its thinkingLevelMap, which both `getSupportedThinkingLevels` (the
+    // picker) and pi-ai read as "supported". With `thinkingEnabled: false` pi-ai
+    // then sends `thinking: { type: "disabled" }` for it
+    // (anthropic-messages.js), the only disable spelling the plugin side can
+    // produce on an adaptive route.
+    efforts.off = null
   }
   return Object.keys(efforts).length > 0 ? efforts : undefined
 }

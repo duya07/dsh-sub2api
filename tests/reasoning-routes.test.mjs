@@ -24,7 +24,10 @@ function harness(resolveKey = async () => 'fake-stored-key') {
       if (!entry) return {status: 404, body: {error: 'not found'}}
       let status = 0, text = ''
       const req = {method: 'POST', socket: {remoteAddress: '127.0.0.1'}, headers: {host: 'localhost:43120'}, ...options,
-        async *[Symbol.asyncIterator]() {yield Buffer.from(JSON.stringify(body))}}
+        async *[Symbol.asyncIterator]() {
+          if (options.fail) throw options.fail
+          yield Buffer.from(options.raw === undefined ? JSON.stringify(body) : options.raw)
+        }}
       await entry.handler(req, {writeHead(code) {status = code}, end(value) {text = value ?? ''}})
       return {status, body: JSON.parse(text || '{}')}
     },
@@ -90,4 +93,48 @@ test('probe resolves only the explicit stored endpoint reference and sanitizes r
     assert.deepEqual(failing.refs, ['OWN_REF'])
     assert.equal(failing.writes, 0)
   } finally {for (const dispose of failing.disposers) dispose()}
+})
+
+// F1 red test: the probe route answered every internal failure with one fixed
+// English string, so the settings page could only ever say "probe request
+// unavailable" no matter which part of the request failed. A reason this module
+// authored itself must survive to the client.
+test('a probe request whose stored key cannot be resolved states the reason instead of one fixed string', async () => {
+  const failing = harness(async () => {throw new Error('fake-secret https://sensitive.test')})
+  try {
+    const value = draft(); value.endpoint.apiKey = ''
+    const result = await failing.call('reasoning/start', value)
+    assert.equal(result.status, 400)
+    assert.ok(result.body.error.startsWith('probe request unavailable: '), `the fixed prefix is kept: ${result.body.error}`)
+    assert.ok(result.body.error.includes('OWN_REF'), `the reason names the endpoint row: ${result.body.error}`)
+    assert.ok(result.body.error.includes('无法解析'), `the reason states what failed: ${result.body.error}`)
+    assert.equal(JSON.stringify(result).includes('sensitive'), false)
+    assert.equal(JSON.stringify(result).includes('fake-secret'), false)
+    assert.deepEqual(failing.refs, ['OWN_REF'])
+    assert.equal(failing.writes, 0)
+  } finally {for (const dispose of failing.disposers) dispose()}
+})
+
+test('a probe request whose body is not JSON states that reason instead of the generic string', async () => {
+  const app = harness()
+  try {
+    const result = await app.call('reasoning/start', {}, {raw: '{'})
+    assert.equal(result.status, 400)
+    assert.equal(result.body.error, 'probe request unavailable: request body is not valid JSON')
+    assert.deepEqual(app.refs, [])
+    assert.equal(app.writes, 0)
+  } finally {for (const dispose of app.disposers) dispose()}
+})
+
+// The added detail must not become a leak channel: an error this module did not
+// author still answers with the bare fixed string and echoes nothing.
+test('an unclassified probe failure keeps the bare fixed wording and echoes nothing', async () => {
+  const app = harness()
+  try {
+    const result = await app.call('reasoning/start', draft(), {fail: new Error('fake-secret https://sensitive.test')})
+    assert.equal(result.status, 400)
+    assert.equal(result.body.error, 'probe request unavailable')
+    assert.equal(JSON.stringify(result).includes('sensitive'), false)
+    assert.equal(JSON.stringify(result).includes('fake-secret'), false)
+  } finally {for (const dispose of app.disposers) dispose()}
 })

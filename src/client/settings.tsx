@@ -212,15 +212,41 @@ interface ProbeState {
   id: string
   phase: 'queued' | 'running' | 'completed' | 'aborted' | 'cancelled' | 'expired' | 'unavailable'
   abortReason?: string
+  /** Set when the batch never started; distinct from abortReason, where the control attempt ended the batch. */
+  unavailableReason?: string
   requests: number
   maxRequests: number
   minGapMs: number
   estimateMs: number
-  levels: Array<{level: string; state: 'accepted' | 'unsupported' | 'unknown'; reason: string}>
+  levels: Array<{level: string; state: 'accepted' | 'unsupported' | 'unknown'; reason: string; maxTokens?: number; cap?: number; parameter?: string; value?: string}>
   suggestion: string[]
 }
 interface ProbeRun { endpoint: number; row: number; signature: string; id?: string; cancelled: boolean; controller: AbortController; timer?: number; deadlineTimer?: number; wake?: () => void; launch?: () => Promise<void>; cancelRequest?: Promise<void> }
 const PROBE_REASONS: Record<string, string> = {'accepted-parameter': '参数已接受，不证明思考生效', 'confirmed-rejection': '重复明确拒绝，且对照成功', 'unconfirmed-rejection': '拒绝未重复确认', 'no-control': '无成功对照', 'parameter-not-exact': '参数被转换或未发送', 'budget-limited': '预算或输出上限不足', 'rate-limited': '限流暂停', 'auth-or-quota': '认证或额度问题', 'upstream-error': '上游失败', 'ambiguous-error': '原因不明确', 'invalid-stream': '响应未完整确认', 'timeout': '超时', 'cancelled': '已取消', 'sdk-unavailable': 'SDK 不可用', 'queued': '待探测'}
+// A level's reason used to exist only as a hover title, so a probe that never
+// left the client still read as a bare "未知，保留" with nothing to act on.
+// These are the reasons that need an instruction, not just a name.
+const PROBE_LEVEL_HINTS: Record<string, string> = {'budget-limited': '该档未发出：预算或输出上限不足', 'parameter-not-exact': '该档未发出：参数被转换或未发送'}
+// A budget verdict is computed from two numbers, so name them: the generic
+// string cannot tell a 131072-token model from a 40000-token one. A not-exact
+// verdict is computed from the wire parameter and the value that went out, so
+// it names those two as well — "参数被转换或未发送" alone says neither what was
+// sent nor what was expected.
+const probeLevelReason = (entry: {level?: string; reason: string; maxTokens?: number; cap?: number; parameter?: string; value?: string}): string => {
+  if (entry.reason === 'budget-limited' && entry.maxTokens !== undefined && entry.cap !== undefined) return `该档未发出：预算不足（maxTokens=${entry.maxTokens}，本次上限 ${entry.cap}）`
+  if (entry.reason === 'parameter-not-exact' && typeof entry.parameter === 'string' && entry.parameter.length > 0) return `该档未发出：参数与期望档位不一致（实际 ${entry.parameter}=${typeof entry.value === 'string' && entry.value.length > 0 ? entry.value : '未发送'}，期望档位 ${entry.level ?? '未知'}）`
+  return PROBE_LEVEL_HINTS[entry.reason] ?? PROBE_REASONS[entry.reason] ?? '未知，保留'
+}
+// An upstream error body can be arbitrarily long; the status line stays readable.
+const PROBE_MESSAGE_LIMIT = 200
+const probeMessage = (value: string): string => value.length > PROBE_MESSAGE_LIMIT ? `${value.slice(0, PROBE_MESSAGE_LIMIT - 1)}…` : value
+// Errors cross realms (a bundle runs in its own context), so instanceof Error
+// is not reliable here; read the message off anything that carries one.
+const probeFailureMessage = (error: unknown): string => {
+  if (typeof error === 'string') return error
+  const message = error && typeof error === 'object' ? (error as {message?: unknown}).message : undefined
+  return typeof message === 'string' ? message : ''
+}
 
 function hasThinkingSuggestion(suggestion: readonly string[]): boolean {
   // An off/none-only map is not a valid thinking capability list for the host.
@@ -777,8 +803,12 @@ export function Sub2ApiSettings() {
             await waitForProbe(run, 1000)
             if (!current(run)) return
           }
-        } catch {
-          if (current(run)) {setProbes(previous => ({...previous, [row.rowId]: {...initial, phase: 'unavailable'}})); cancelRun(run)}
+        } catch (error) {
+          // The failure message is the only thing that says why the batch never
+          // started; dropping it left a bare "探测不可用" with nothing to act on.
+          // Bound it at the point it is stored: the 200-character limit is a
+          // property of the state, not of whichever renderer happens to read it.
+          if (current(run)) {setProbes(previous => ({...previous, [row.rowId]: {...initial, phase: 'unavailable', unavailableReason: probeMessage(probeFailureMessage(error))}})); cancelRun(run)}
         }
       }
       pendingProbes.current.push(run)
@@ -1293,10 +1323,10 @@ export function Sub2ApiSettings() {
                             </div>
                             <div className="s2a_probeEntry"><button type="button" className="s2a_btn" aria-label={`${title} ${row.id} 探测档位`} disabled={busy.length > 0 || !row.id.trim() || ['queued', 'running'].includes(probes[row.rowId]?.phase ?? '')} onClick={() => startProbes(endpoint, [row], true)}>探测档位</button></div>
                             {probes[row.rowId] && <div className="s2a_probe" role="status" aria-live="polite">
-                              <span className="s2a_probeStatus">{({queued: '排队中', running: '探测中', completed: '探测完成', cancelled: '已取消', expired: '已超时，未知档位保留', unavailable: '探测不可用，档位保留', aborted: '探测中止'})[probes[row.rowId]!.phase]} · {probes[row.rowId]!.requests}/{probes[row.rowId]!.maxRequests} 次请求{probes[row.rowId]!.phase === 'aborted' ? ` · 原因：${PROBE_REASONS[probes[row.rowId]!.abortReason ?? ''] ?? '原因未知'}` : ''}{['queued', 'running'].includes(probes[row.rowId]!.phase) ? ` · 预计 ${Math.ceil(probes[row.rowId]!.estimateMs / 1000)} 秒` : ''}</span>
+                              <span className="s2a_probeStatus">{({queued: '排队中', running: '探测中', completed: '探测完成', cancelled: '已取消', expired: '已超时，未知档位保留', unavailable: '探测不可用，档位保留', aborted: '探测中止'})[probes[row.rowId]!.phase]} · {probes[row.rowId]!.requests}/{probes[row.rowId]!.maxRequests} 次请求{probes[row.rowId]!.phase === 'aborted' ? ` · 原因：${PROBE_REASONS[probes[row.rowId]!.abortReason ?? ''] ?? '原因未知'}` : ''}{probes[row.rowId]!.phase === 'unavailable' && probes[row.rowId]!.unavailableReason ? ` · 原因：${probes[row.rowId]!.unavailableReason!}` : ''}{['queued', 'running'].includes(probes[row.rowId]!.phase) ? ` · 预计 ${Math.ceil(probes[row.rowId]!.estimateMs / 1000)} 秒` : ''}</span>
                               {['queued', 'running'].includes(probes[row.rowId]!.phase) && <button type="button" className="s2a_btn" aria-label={`${title} ${row.id} 取消探测`} onClick={() => cancelProbe(row.rowId)}>取消</button>}
                               {probes[row.rowId]!.phase === 'completed' && hasThinkingSuggestion(probes[row.rowId]!.suggestion) && (row.fromSaved || row.reasoningEdited || row.reasoning === 'off') && <button type="button" className="s2a_btn" aria-label={`${title} ${row.id} 应用探测建议`} onClick={() => applyProbe(endpoint.rowId, row.rowId)}>应用建议</button>}
-                              <span className="s2a_probeLevels">{probes[row.rowId]!.levels.map(level => <span key={level.level} title={PROBE_REASONS[level.reason] ?? '未知，保留'}>{level.level}: {({accepted: '参数已接受', unsupported: '已确认不支持', unknown: '未知，保留'})[level.state]}</span>)}</span>
+                              <span className="s2a_probeLevels">{probes[row.rowId]!.levels.map(level => <span key={level.level} title={probeLevelReason(level)}>{level.level}: {({accepted: '参数已接受', unsupported: '已确认不支持', unknown: '未知，保留'})[level.state]}{level.state === 'unknown' ? `（${probeLevelReason(level)}）` : ''}</span>)}</span>
                             </div>}
                             {expanded && (
                               <div id={detailsId} className="s2a_modelDetails">
