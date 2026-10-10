@@ -28,6 +28,11 @@ import {
 } from './index.ts'
 import { endpointRoute } from './pi-ai.ts'
 import {
+  IMAGE_TOOL_PROMPT_SECTION,
+  LEGACY_IMAGE_TOOL_NAME,
+  STABLE_IMAGE_TOOL_NAME,
+} from './shared/image-tool-names.ts'
+import {
   DEFAULT_RATE_LIMIT_RETRY_POLICY,
   HttpIdleTimeoutError,
   TRANSIENT_HTTP_FAILURE,
@@ -59,7 +64,7 @@ function getFs(ctx: Context): ImageFs | undefined {
   return (ctx as Context & { get(name: 'fs'): ImageFs | undefined }).get('fs')
 }
 
-export const GENERATE_IMAGE_NAME = 'generate_image'
+export const GENERATE_IMAGE_NAME: string = LEGACY_IMAGE_TOOL_NAME
 export const DEFAULT_IMAGE_TOOL_TIMEOUT_MS = 180_000
 export const DEFAULT_MAX_IMAGE_BYTES: number = 20 * 1024 * 1024
 
@@ -83,6 +88,42 @@ export const IMAGE_TOOL_IDLE_TIMEOUT_MS: number = 120_000
  * requests.
  */
 export const IMAGE_TOOL_RATE_LIMIT_RETRY_POLICY: RateLimitRetryPolicy = DEFAULT_RATE_LIMIT_RETRY_POLICY
+
+/**
+ * The slice of the host tool registry this plugin needs. `get` is optional so
+ * the plugin keeps working against hosts (and test doubles) that only expose
+ * `register`.
+ */
+interface ToolRegistry {
+  register: (definition: unknown) => unknown
+  get?: (name: string) => unknown
+}
+
+/** True when `error` is the host's own "name already taken" rejection. */
+function isOwnDuplicateNameError(error: unknown, name: string): boolean {
+  return error instanceof Error && error.message.startsWith(`tool "${name}" is already registered`)
+}
+
+/**
+ * True when another tool already owns `name`. A registry without `get` (older
+ * hosts and minimal test doubles) cannot be asked, so the name is assumed free
+ * and registration is still attempted. A `get` that throws is a real registry
+ * failure — it propagates, because treating it as "free" would register into a
+ * broken registry and advertise a tool nobody can resolve.
+ */
+function isToolNameTaken(tools: ToolRegistry, name: string): boolean {
+  if (typeof tools.get !== 'function') return false
+  return tools.get(name) !== undefined
+}
+
+/** Prompt text for the names this plugin registered; empty string drops the section. */
+function imageToolPromptText(names: readonly string[]): string {
+  if (names.length === 0) return ''
+  const primary = names[0]!
+  const alias = names.length > 1 ? names[1]! : undefined
+  const subject = alias === undefined ? primary : `${primary} (or ${alias} where that name is still free)`
+  return `Use the ${subject} tool to create an image with the configured image model and write it to the workspace. Call it when the current chat model cannot generate images. Pass referenceImages (1–5 complete image references) to edit existing images; omit it to generate a new one. The tool returns the saved file path, not the image bytes.`
+}
 
 const IMAGE_EXTENSIONS: Record<string, ImageMediaType> = {
   '.png': 'image/png',
@@ -564,6 +605,7 @@ function defaultOutputName(mediaType: ImageMediaType): string {
 async function writeGeneratedFile(
   ctx: Context,
   exec: { signal: AbortSignal; agent?: { session: { header: { cwd?: string } } } },
+  toolName: string,
   requestedPath: string | undefined,
   data: Uint8Array,
   mediaType: ImageMediaType,
@@ -579,7 +621,7 @@ async function writeGeneratedFile(
   if (cwd !== undefined) {
     const root = await fs.resolve('.', { cwd, signal: exec.signal })
     if (!fs.contains(root, target)) {
-      throw new Error(`generate_image can only write inside the session workspace; refused "${target.displayPath}"`)
+      throw new Error(`${toolName} can only write inside the session workspace; refused "${target.displayPath}"`)
     }
   }
   const abs = fs.processPath(target)
@@ -676,14 +718,11 @@ async function generateViaChat(
 
 export function registerImageTools(ctx: Context, host: ImageToolHost): void {
   ctx.inject(['tools', 'systemPrompt'], (toolCtx) => {
-    toolCtx.systemPrompt.section({
-      name: 'tool:generate_image',
-      order: 119,
-      text: 'Use the generate_image tool to create an image with the configured image model and write it to the workspace. Call it when the current chat model cannot generate images. Pass referenceImages (1–5 complete image references) to edit existing images; omit it to generate a new one. The tool returns the saved file path, not the image bytes.',
-    })
+    const tools = toolCtx.tools as unknown as ToolRegistry
+    const registered: string[] = []
 
-    toolCtx.tools.register(defineTool({
-      name: GENERATE_IMAGE_NAME,
+    const defineImageTool = (name: string) => defineTool({
+      name,
       description: 'Generate or edit an image with the configured image model and write it to the workspace. Use this when the current chat model cannot generate images. Pass referenceImages (1–5 complete DSH image references) to edit existing images; an unusable reference is an error and is never replaced by a new generation. Returns the saved file path.',
       parameters: {
         prompt: {
@@ -804,7 +843,7 @@ export function registerImageTools(ctx: Context, host: ImageToolHost): void {
             image = await generateViaChat(host, resolved, prompt, exec.signal, maxBytes)
           }
         }
-        const path = await writeGeneratedFile(ctx, exec, args.file_path, image.data, image.mediaType)
+        const path = await writeGeneratedFile(ctx, exec, name, args.file_path, image.data, image.mediaType)
         // Save the generated bytes as a durable attachment so the tool result
         // can carry an image content block that the chat UI renders inline.
         let attachment: ImageAttachmentRef | undefined
@@ -855,6 +894,30 @@ export function registerImageTools(ctx: Context, host: ImageToolHost): void {
         }
         return undefined
       },
-    }))
+    })
+
+    const attempt = (name: string): void => {
+      if (isToolNameTaken(tools, name)) return
+      try {
+        toolCtx.tools.register(defineImageTool(name))
+      } catch (error) {
+        if (!isOwnDuplicateNameError(error, name)) throw error
+        return
+      }
+      registered.push(name)
+    }
+
+    attempt(STABLE_IMAGE_TOOL_NAME)
+    if (host.config?.()?.tools?.generate?.compatToolName === true) {
+      attempt(LEGACY_IMAGE_TOOL_NAME)
+    }
+
+    // Rendered lazily so the prompt can only ever name tools this plugin
+    // actually registered.
+    toolCtx.systemPrompt.section({
+      name: IMAGE_TOOL_PROMPT_SECTION,
+      order: 119,
+      text: () => imageToolPromptText(registered),
+    })
   })
 }

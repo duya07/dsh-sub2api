@@ -169,9 +169,17 @@ export interface ImageToolModelRef {
     provider: string;
     /** Model id sent to the gateway. */
     model: string;
+    /**
+     * Opt-in compatibility switch: also register the legacy `generate_image`
+     * name, but only while that name is still free. Off by default, so this
+     * plugin never competes with another image plugin for the plain name.
+     * Toggling it changes what the next plugin load registers — it is not a hot
+     * switch.
+     */
+    compatToolName?: boolean;
 }
 export interface ImageToolsConfig {
-    /** Image-generation model used by the global `generate_image` tool. */
+    /** Image-generation model used by the global `sub2api_generate_image` tool. */
     generate?: ImageToolModelRef;
     /** Gateway-backed candidate for the host's global `web_search` tool. */
     webSearch?: WebSearchToolConfig;

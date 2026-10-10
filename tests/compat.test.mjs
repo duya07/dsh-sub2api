@@ -78,8 +78,10 @@ test('browser bundle registers settings and renders running/settled image tools'
   const entries = []
   plugin.apply({slots: {inject(_name, callback) { callback() }, register(options, component) { entries.push({options, component}) }}})
   assert.equal(entries[0].options.name, 'settings.section')
-  const view = entries.find(entry => entry.options.key === 'generate_image').component
-  assert.match(JSON.stringify(view({block: {name: 'generate_image'}})), /生成图片/)
+  const view = entries.find(entry => entry.options.key === 'sub2api_generate_image').component
+  // The legacy native name stays free for whichever plugin owns it.
+  assert.equal(entries.some(entry => entry.options.key === 'generate_image'), false)
+  assert.match(JSON.stringify(view({block: {name: 'sub2api_generate_image'}})), /生成图片/)
   const result = view({block: {kind: 'tool-result', content: [{type: 'text', text: 'saved'}, {type: 'image', attachment: {attachmentId: 'test', mediaType: 'image/png'}}]}})
   assert.match(JSON.stringify(result), /plugins\/dsh-sub2api\/attachment/)
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
@@ -227,6 +229,6 @@ test('only the image-generation tool and prompt are registered', async () => {
   const { registerImageTools } = await import('../src/image-tools.ts')
   const tools = [], prompts = []
   registerImageTools({inject(_deps, callback) {callback({tools: {register(tool) {tools.push(tool)}}, systemPrompt: {section(prompt) {prompts.push(prompt)}}})}}, {})
-  assert.deepEqual(tools.map(tool => tool.name), ['generate_image'])
-  assert.deepEqual(prompts.map(prompt => prompt.name), ['tool:generate_image'])
+  assert.deepEqual(tools.map(tool => tool.name), ['sub2api_generate_image'])
+  assert.deepEqual(prompts.map(prompt => prompt.name), ['tool:sub2api_generate_image'])
 })

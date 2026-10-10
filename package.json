@@ -1,7 +1,7 @@
 {
   "name": "@godd6366/dsh-sub2api",
   "description": "DSH 0.2 Sub2API gateway integration with independent endpoints and keys, model discovery, conservative reasoning probes, usage lookup and image generation.",
-  "version": "0.2.1-dsh02.11",
+  "version": "0.2.1-dsh02.12",
   "license": "MIT",
   "keywords": [
     "dsh-plugin",

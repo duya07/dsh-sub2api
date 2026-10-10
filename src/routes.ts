@@ -263,7 +263,8 @@ function readToolModelRef(value: unknown): ImageToolModelRef | undefined {
   const provider = typeof raw.provider === 'string' ? raw.provider.trim() : ''
   const model = typeof raw.model === 'string' ? raw.model.trim() : ''
   if (provider.length === 0 || model.length === 0) return undefined
-  return { provider, model }
+  const compatToolName = typeof raw.compatToolName === 'boolean' ? raw.compatToolName : undefined
+  return { provider, model, ...(compatToolName !== undefined ? { compatToolName } : {}) }
 }
 
 /**

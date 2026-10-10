@@ -267,6 +267,8 @@ const DEFAULT_REASONING_LEVELS = ['low', 'medium', 'high']
 interface ImageToolModelRef {
   provider: string
   model: string
+  /** Opt-in legacy `generate_image` alias; only takes effect on the next plugin load. */
+  compatToolName: boolean
 }
 
 interface WebSearchToolState {
@@ -299,7 +301,7 @@ interface ConfigState {
   providers?: Record<string, { keyConfigured: boolean; models: Array<CatalogModel | string> }>
   endpoints?: ConfigPayloadEndpoint[]
   tools?: {
-    generate?: ImageToolModelRef
+    generate?: { provider: string; model: string; compatToolName?: boolean }
     webSearch?: { enabled?: boolean; provider?: string; model?: string }
   }
 }
@@ -495,7 +497,7 @@ function endpointRowFrom(value: ConfigPayloadEndpoint): EndpointState {
 }
 
 function emptyToolRef(): ImageToolModelRef {
-  return { provider: '', model: '' }
+  return { provider: '', model: '', compatToolName: false }
 }
 
 function emptyTools(): ImageToolsState {
@@ -506,11 +508,13 @@ function emptyTools(): ImageToolsState {
  * The stored ref names either an endpoint's route id (`sub2api-openai-gw2`) or,
  * for sections written before endpoints existed, a bare platform key.
  */
-function toolRefFromConfig(value: ImageToolModelRef | undefined): ImageToolModelRef {
+function toolRefFromConfig(value: { provider?: unknown; model?: unknown; compatToolName?: unknown } | undefined): ImageToolModelRef {
   const provider = typeof value?.provider === 'string' ? value.provider : ''
   const model = typeof value?.model === 'string' ? value.model : ''
   const known = PROVIDERS.some((def) => def.key === provider) || provider.startsWith('sub2api-')
-  return known ? { provider, model } : { provider: '', model: '' }
+  if (!known) return { provider: '', model: '', compatToolName: false }
+  // A section written before the switch existed reads as off.
+  return { provider, model, compatToolName: value?.compatToolName === true }
 }
 
 function toolOptions(endpoints: readonly EndpointState[]): Array<{ value: string; label: string; provider: string; model: string }> {
@@ -535,7 +539,7 @@ function toolOptions(endpoints: readonly EndpointState[]): Array<{ value: string
   return options
 }
 
-function serializeToolRef(ref: ImageToolModelRef): ImageToolModelRef | undefined {
+function serializeToolRef(ref: { provider: string; model: string }): { provider: string; model: string } | undefined {
   const provider = ref.provider.trim()
   const model = ref.model.trim()
   if (provider.length === 0 || model.length === 0) return undefined
@@ -897,7 +901,12 @@ export function Sub2ApiSettings() {
         tools: {} as { generate?: ImageToolModelRef; webSearch?: { enabled: true; provider: string; model: string } },
       }
       const generate = serializeToolRef(tools.generate)
-      if (generate !== undefined) payload.tools.generate = generate
+      if (generate !== undefined) {
+        // Always publish the switch explicitly: an omitted field keeps whatever
+        // the server already stored, so a checkbox the user turns off would not
+        // stick.
+        payload.tools.generate = { ...generate, compatToolName: tools.generate.compatToolName }
+      }
       if (tools.webSearch.enabled) {
         const webSearch = serializeToolRef(tools.webSearch)
         if (webSearch === undefined) throw new Error('启用联网搜索需要先选择一个搜索模型')
@@ -1053,12 +1062,12 @@ export function Sub2ApiSettings() {
         <div className="s2a_rowHead">
           <div className="s2a_rowIdentity">
             <span className="s2a_rowName">图片生成工具</span>
-            <span className="s2a_rowTag">generate_image</span>
+            <span className="s2a_rowTag">sub2api_generate_image</span>
           </div>
         </div>
         <div className="s2a_editor">
           <p className="s2a_intro">
-            指定生成图片使用的模型，生成结果会保存到工作区。
+            指定生成图片使用的模型，生成结果会保存到工作区。工具以独立名称 sub2api_generate_image 注册，不会与其它插件的同名工具抢占。
           </p>
           {(['generate'] as const).map((kind) => {
             const label = '生图模型'
@@ -1077,7 +1086,9 @@ export function Sub2ApiSettings() {
                     const next = options.find((option) => option.value === event.target.value)
                     setTools((current) => ({
                       ...current,
-                      [kind]: next === undefined ? emptyToolRef() : { provider: next.provider, model: next.model },
+                      [kind]: next === undefined
+                        ? emptyToolRef()
+                        : { provider: next.provider, model: next.model, compatToolName: current.generate.compatToolName },
                     }))
                   }}
                 >
@@ -1092,6 +1103,23 @@ export function Sub2ApiSettings() {
               </div>
             )
           })}
+          <div className="s2a_field">
+            <label className="s2a_fieldLabel" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <input
+                type="checkbox"
+                aria-label="启用兼容工具名 generate_image"
+                checked={tools.generate.compatToolName}
+                onChange={(event) => {
+                  const checked = event.target.checked
+                  setTools((current) => ({ ...current, generate: { ...current.generate, compatToolName: checked } }))
+                }}
+              />
+              同时注册兼容工具名 generate_image（默认关闭）
+            </label>
+            <p className="s2a_intro" style={{ marginTop: 4 }}>
+              仅在旧名 generate_image 仍空闲时生效，供旧提示词或旧引用继续调用；保存后需重新加载插件（或重启 DSH）才生效，不是热切换。
+            </p>
+          </div>
         </div>
       </div>
       <div className="s2a_rowCard">

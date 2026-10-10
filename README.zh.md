@@ -2,7 +2,7 @@
 
 [English](./README.md) | [变更记录](./CHANGELOG.md)
 
-将 [Sub2API](https://github.com/Wei-Shaw/sub2api) 网关接入 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)。这是 **duya07/dsh-sub2api** fork，基于 GodD6366 上游提交 `610ff6f26370a587223cff27449ea894ad87da96`。包名暂保持 `@godd6366/dsh-sub2api`，版本为 `0.2.1-dsh02.10`；保留包名不表示 npm 上已有此 fork 的新版本。本次交付不是 npm 发布。
+将 [Sub2API](https://github.com/Wei-Shaw/sub2api) 网关接入 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)。这是 **duya07/dsh-sub2api** fork，基于 GodD6366 上游提交 `610ff6f26370a587223cff27449ea894ad87da96`。包名暂保持 `@godd6366/dsh-sub2api`，版本为 `0.2.1-dsh02.12`；保留包名不表示 npm 上已有此 fork 的新版本。本次交付不是 npm 发布。
 
 ## 相较上游的更新点
 
@@ -22,6 +22,8 @@
 12. **档位结论由真实 payload 裁决，不再从模型的输出上限预测。** 当模型自身的 `maxTokens` 超过探测上限时，探测不再把该档短路成 `budget-limited`：探针请求的始终是 `maxTokens: cap`，模型自己的上限并不能说明 SDK 会写出什么；而在 OpenAI 系列路由上，这条预测会让五档在发出任何请求前就全部阵亡——实际 payload 写的是 `max_output_tokens = cap`，正好落在允许的边界上。现在所有协议都会真正发出请求，由 `inspectProbeWire` 对 SDK 构造出的 payload 裁决；`budget-limited` 只作为真实的 payload 结论存在，并且仍然带上判定所依据的两个数字。
 13. **插件自发请求具备 HTTP 韧性。** 可选的 `web_search` 请求与所有 `generate_image` 请求（含远程参考图下载）现在都经过 `src/http-resilience.ts`。网关接受连接后不再发送数据时，会在固定静默窗口后放弃并报为空闲超时——web search 90 秒、图像工具 120 秒——而不再是一直到调用方总超时（`DEFAULT_IMAGE_TOOL_TIMEOUT_MS` = 180 秒是总预算，不是空闲检测）才失败、此前无法区分“仍在慢慢吐”与“连接已死”。`429` **最多重试一次**，且仅在 `retry-after`（纯秒数或 HTTP-date）或 `x-ratelimit-reset-requests` / `x-ratelimit-reset-tokens` 给出确定延迟时才重试；没有给出延迟的 `429` 直接如实上报，其他状态码一律不重试。重试是显式策略：`DEFAULT_RATE_LIMIT_RETRY_POLICY = { enabled: true, maxRetries: 1 }`，可按 host 覆盖（`{ enabled: false }` 或 `maxRetries: 0` 恢复此前的单发行为）。`classifyHttpFailure` 把失败分为 `rate-limited` / `auth` / `quota` / `transient` / `permanent` 五类，每类带保守冷却时间；reasoning probe 自己的 `Retry-After` 处理未改动。
 14. **失败的端点会被记住，而不是每次重新发现。** `src/http-resilience.ts` 现在维护一份端点级登记表（`EndpointCooldownTracker`，以 `endpointCooldowns` 在进程内共享），键为归一化后的网关根地址，因此 `HTTPS://GW.example/V1/` 与 `https://gw.example/v1` 是同一个端点。一分钟记忆窗口（`ENDPOINT_FAILURE_MEMORY_MS`）内连续两次失败（`ENDPOINT_FAILURE_THRESHOLD`）即进入冷却；单次失败只当作抖动，相隔一小时的两次失败也不会累加。冷却期内，对该端点的下一次自发请求会立即失败并给出可读原因（`endpoint cooling down after 2 consecutive failures (rate-limited); retry in 41234ms`），不再白等一个静默窗口；触发冷却的那次失败本身也会附带同样的说明。冷却时长按失败类别区分——`rate-limited` 60 秒、`auth` 5 分钟、`quota` 15 分钟、`transient` 5 秒、`permanent` 不冷却——上游给出的 `retry-after` / `x-ratelimit-reset-*` 优先于类别默认值，并由 `MAX_ENDPOINT_COOLDOWN_MS`（15 分钟）封顶，因此网关即使声明数小时也不会把冷却变成永久故障。一次成功立即清除该端点，冷却都会自行结束，内存有界（`MAX_TRACKED_ENDPOINTS` = 64，最久未触碰者先淘汰，不做任何持久化）。两条插件自发请求路径——`web_search` 的 `/responses` POST 与 `generate_image` 的 `gatewayFetch`——共用同一份登记表，因此搜索路径发现某端点不可用，图像编辑路径也会知道。
+
+15. **生图工具不再与其它插件争抢名字。** `generate_image` 同样被 dsh-image-gen 注册，而宿主拒绝同一名字的第二个注册者（`tool "generate_image" is already registered ...`），因此此前后加载的那个插件会整个失去生图工具。本 fork 现在默认注册 `sub2api_generate_image`，把上游名字降级为默认关闭的 opt-in 别名（`tools.generate.compatToolName`），且仅在该名仍空闲时才尝试注册：已被别的工具占用的名字一律不碰，宿主对本插件自己名字的重复拒绝也会被吞掉而不是让加载失败。于是两个插件以任意顺序加载都不会互相顶掉。`systemPrompt` 段落改名为 `tool:sub2api_generate_image` 并惰性渲染，因此只会提到本插件确实注册成功的名字；设置页对应行改了标签并新增该别名的复选框，保存后需重新加载插件才生效，不是热切换。宿主侧与浏览器侧共用的名字常量放在零依赖的 `src/shared/image-tool-names.ts`。
 
 评审过其他项目但未采纳：订阅登录、账号池、额度显示、复用 Claude Code 凭据、修改默认模型、`x_search` 与视频生成。
 
@@ -50,7 +52,7 @@ npm ci --ignore-scripts
 npm run typecheck
 npm test
 npm pack --ignore-scripts
-dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.10.tgz
+dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.12.tgz
 ```
 
 `npm test` 会先构建再测试，因此即使安装、打包时禁用了生命周期脚本，打出的包仍包含刚构建的 `lib` 产物。上述 tgz 名称来自当前包名与版本；若它们发生变化，请使用 `npm pack` 实际输出的文件名。安装后重启 DSH/desktop。若使用的不是 `desktop` profile，将命令中的 `desktop` 换成自己的 profile 名称。

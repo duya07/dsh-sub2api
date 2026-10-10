@@ -9,7 +9,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import { type Config, type ProviderProfile } from './index.js';
 import { type EndpointCooldownTracker, type RateLimitRetryPolicy } from './http-resilience.js';
-export declare const GENERATE_IMAGE_NAME = "generate_image";
+export declare const GENERATE_IMAGE_NAME: string;
 export declare const DEFAULT_IMAGE_TOOL_TIMEOUT_MS = 180000;
 export declare const DEFAULT_MAX_IMAGE_BYTES: number;
 /**
