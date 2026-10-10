@@ -10,6 +10,13 @@ import {
   registerWebSearchProvider,
   resolveWebSearchTarget,
 } from '../src/web-search.ts'
+import { endpointCooldowns } from '../src/http-resilience.ts'
+
+// The endpoint cooldown registry is process-wide on purpose, so tests that
+// deliberately fail against the same endpoint must not leak into each other.
+test.beforeEach(() => {
+  endpointCooldowns.clear()
+})
 
 const FAKE_KEY = 'sk-sub2api-fake-key-never-echo'
 
@@ -119,7 +126,12 @@ test('one search posts a single Responses request with the native web_search too
     tools: [{ type: 'web_search' }],
     stream: false,
   })
-  assert.equal(calls[0].init.signal, undefined)
+  // The attempt always receives the plugin's own composed watchdog signal,
+  // even when the caller passed none: that is what lets a gateway that stops
+  // sending data be abandoned before the caller's total timeout. It must never
+  // be the caller's signal, and it must start un-aborted.
+  assert.ok(calls[0].init.signal instanceof AbortSignal)
+  assert.equal(calls[0].init.signal.aborted, false)
   assert.equal(result.truncated, false)
   assert.equal(result.content, 'Answer text')
   assert.deepEqual(result.sources, [
@@ -147,6 +159,41 @@ test('gateway failures surface one coded error that never echoes the key', async
     })
   })
   assert.equal(calls.length, 1)
+})
+
+test('a 429 that states a Retry-After is retried exactly once', async () => {
+  const config = section({ webSearch: enabled() })
+  const calls = []
+  const result = await withFetch(async (url) => {
+    calls.push(url)
+    if (calls.length === 1) {
+      return new Response(JSON.stringify({ error: { message: 'slow down' } }), {
+        status: 429,
+        headers: { 'content-type': 'application/json', 'retry-after': '0' },
+      })
+    }
+    return jsonResponse({ output: [messageItem('Recovered', [])] })
+  }, () => new Sub2ApiWebSearchProvider(host(config)).search({ query: 'q' }))
+  assert.equal(calls.length, 2)
+  assert.equal(result.content, 'Recovered')
+})
+
+test('a gateway that stops sending data trips the idle watchdog', async () => {
+  const config = section({ webSearch: enabled() })
+  let calls = 0
+  await withFetch(async (url, init) => new Promise((_resolve, reject) => {
+    calls++
+    init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true })
+  }), async () => {
+    const provider = new Sub2ApiWebSearchProvider({ ...host(config), idleTimeoutMs: 30 })
+    await assert.rejects(() => provider.search({ query: 'q' }), (error) => {
+      assert.ok(error instanceof Sub2ApiWebError)
+      assert.equal(error.code, 'WEB_PROVIDER_ERROR')
+      assert.match(error.message, /idle timeout/)
+      return true
+    })
+  })
+  assert.equal(calls, 1)
 })
 
 test('an already-aborted signal never dispatches a request', async () => {

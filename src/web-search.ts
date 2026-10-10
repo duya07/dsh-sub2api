@@ -16,8 +16,11 @@
  *    *available* providers exist and no explicit `searchProvider` is
  *    configured, so an always-available candidate would break the search setup
  *    that already works today.
- * 2. One request per search: no hidden retries, and a coded error preserves the
- *    host's `WEB_*` error contract.
+ * 2. One search is one bounded exchange: a coded error preserves the host's
+ *    `WEB_*` error contract, and the only retry this path performs is a single
+ *    extra attempt for a `429` that states a parseable `Retry-After`
+ *    ({@link WEB_SEARCH_RATE_LIMIT_RETRY_POLICY}). Every other status is
+ *    reported as it arrived, and an unparseable delay is never guessed at.
  *
  * The host's `@deepseek-ai/dsh-web` package ships no declaration file and is
  * deliberately absent from this plugin's dependencies, so this module defines
@@ -31,12 +34,44 @@ import type { Context } from '@deepseek-ai/cordis'
 import { HarnessError, attributionHeaders } from '@deepseek-ai/dsh-llm'
 import { apiProtocolForKey, gatewayApiRoot, type ApiProtocol, type Config, type ProviderKey, type ProviderProfile } from './index.ts'
 import { endpointRoute, platformLabel } from './pi-ai.ts'
+import {
+  DEFAULT_RATE_LIMIT_RETRY_POLICY,
+  HttpIdleTimeoutError,
+  TRANSIENT_HTTP_FAILURE,
+  classifyHttpFailure,
+  cooldownNote,
+  endpointCooldowns,
+  fetchWithResilience,
+  type EndpointCooldownTracker,
+  type RateLimitRetryPolicy,
+} from './http-resilience.ts'
 
 /** Stable id this provider registers under with the host's `ctx.web` seam. */
 export const SUB2API_WEB_SEARCH_PROVIDER_ID: string = 'sub2api'
 
 /** Upper bound on a gateway search response body this plugin is willing to buffer. */
 export const MAX_SEARCH_RESPONSE_BYTES: number = 2 * 1024 * 1024
+
+/**
+ * How long one `/responses` attempt may stay silent before the idle watchdog
+ * aborts it.
+ *
+ * This gateway does **not** forward streaming search results: it runs its own
+ * `web_search` tool and only answers once it is done, so the response headers
+ * themselves have been observed to arrive 6–23 seconds in. The idle window must
+ * therefore sit far above a normal first byte, not at the "a few seconds" a
+ * streaming client would use — 90 seconds is roughly four times the slowest
+ * observed header arrival, so it only fires on a genuinely dead connection.
+ * The caller's own signal still cancels immediately.
+ */
+export const WEB_SEARCH_IDLE_TIMEOUT_MS: number = 90_000
+
+/**
+ * The bounded retry policy for this path: at most one extra attempt, and only
+ * for a `429` that states a delay this plugin can parse. Exported so a host or
+ * a test can pass `{ enabled: false }` and get strictly single-shot requests.
+ */
+export const WEB_SEARCH_RATE_LIMIT_RETRY_POLICY: RateLimitRetryPolicy = DEFAULT_RATE_LIMIT_RETRY_POLICY
 
 /** Longest gateway error message echoed into a thrown error. */
 const MAX_ERROR_DETAIL_LENGTH = 300
@@ -70,6 +105,20 @@ export interface WebSearchRequest {
 export interface WebSearchHost {
   config: () => Config
   resolveApiKey: (route: string, profile: ProviderProfile) => Promise<string>
+  /**
+   * Override the idle window of one `/responses` attempt. Defaults to
+   * {@link WEB_SEARCH_IDLE_TIMEOUT_MS}; a non-positive value disables the
+   * watchdog.
+   */
+  idleTimeoutMs?: number
+  /** Override the bounded `429` retry policy. Defaults to {@link WEB_SEARCH_RATE_LIMIT_RETRY_POLICY}. */
+  rateLimitRetry?: RateLimitRetryPolicy
+  /**
+   * Endpoint failure memory. Defaults to the process-wide
+   * {@link endpointCooldowns}, so a search shares one view of a broken endpoint
+   * with the image tools; tests inject their own tracker to stay isolated.
+   */
+  endpointCooldowns?: EndpointCooldownTracker
 }
 
 /**
@@ -311,6 +360,14 @@ export class Sub2ApiWebSearchProvider {
     }
     if (signal?.aborted) throw abortedError()
 
+    // An endpoint that just failed twice in a row is not asked again: the
+    // caller learns why now, instead of waiting out another idle window.
+    const cooldowns = this.host.endpointCooldowns ?? endpointCooldowns
+    const parked = cooldowns.check(target.baseURL)
+    if (parked !== undefined) {
+      throw new Sub2ApiWebError(`sub2api web search: ${parked.message}`, 'WEB_PROVIDER_ERROR')
+    }
+
     let apiKey: string
     try {
       apiKey = await this.host.resolveApiKey(target.route, target.profile)
@@ -326,7 +383,7 @@ export class Sub2ApiWebSearchProvider {
     const endpoint = `${target.baseURL}/responses`
     let response: Response
     try {
-      response = await fetch(endpoint, {
+      const outcome = await fetchWithResilience((attemptSignal) => fetch(endpoint, {
         method: 'POST',
         headers: {
           authorization: `Bearer ${apiKey}`,
@@ -340,12 +397,28 @@ export class Sub2ApiWebSearchProvider {
           tools: [{ type: 'web_search' }],
           stream: false,
         }),
+        signal: attemptSignal,
+      }), {
         signal,
+        idleMs: this.host.idleTimeoutMs ?? WEB_SEARCH_IDLE_TIMEOUT_MS,
+        policy: this.host.rateLimitRetry ?? WEB_SEARCH_RATE_LIMIT_RETRY_POLICY,
       })
+      response = outcome.response
     } catch (error) {
+      // A silent gateway is reported as such: the total timeout of the caller
+      // cannot tell "still searching" from "connection is dead".
+      if (error instanceof HttpIdleTimeoutError) {
+        const note = cooldownNote(cooldowns.recordFailure(target.baseURL, TRANSIENT_HTTP_FAILURE))
+        throw new Sub2ApiWebError(
+          `sub2api web search: gateway stopped sending data for ${error.idleMs}ms (idle timeout)${note}`,
+          'WEB_PROVIDER_ERROR',
+          { cause: error },
+        )
+      }
       if (signal?.aborted) throw abortedError(error)
+      const note = cooldownNote(cooldowns.recordFailure(target.baseURL, TRANSIENT_HTTP_FAILURE))
       throw new Sub2ApiWebError(
-        `sub2api web search: request to ${endpoint} failed`,
+        `sub2api web search: request to ${endpoint} failed${note}`,
         'WEB_PROVIDER_ERROR',
         { cause: error },
       )
@@ -353,11 +426,16 @@ export class Sub2ApiWebSearchProvider {
 
     if (!response.ok) {
       const detail = await readErrorDetail(response)
+      const note = cooldownNote(
+        cooldowns.recordFailure(target.baseURL, classifyHttpFailure(response.status, response.headers)),
+      )
       throw new Sub2ApiWebError(
-        `sub2api web search failed (HTTP ${response.status}): ${detail}`,
+        `sub2api web search failed (HTTP ${response.status}): ${detail}${note}`,
         'WEB_PROVIDER_ERROR',
       )
     }
+    // The endpoint answered: whatever it failed with before is history.
+    cooldowns.recordSuccess(target.baseURL)
 
     let text: string
     try {

@@ -27,6 +27,17 @@ import {
   type ProviderProfile,
 } from './index.ts'
 import { endpointRoute } from './pi-ai.ts'
+import {
+  DEFAULT_RATE_LIMIT_RETRY_POLICY,
+  HttpIdleTimeoutError,
+  TRANSIENT_HTTP_FAILURE,
+  classifyHttpFailure,
+  cooldownNote,
+  endpointCooldowns,
+  fetchWithResilience,
+  type EndpointCooldownTracker,
+  type RateLimitRetryPolicy,
+} from './http-resilience.ts'
 
 interface ImageFsTarget {
   displayPath: string
@@ -51,6 +62,27 @@ function getFs(ctx: Context): ImageFs | undefined {
 export const GENERATE_IMAGE_NAME = 'generate_image'
 export const DEFAULT_IMAGE_TOOL_TIMEOUT_MS = 180_000
 export const DEFAULT_MAX_IMAGE_BYTES: number = 20 * 1024 * 1024
+
+/**
+ * How long one image-path request may stay silent before the idle watchdog
+ * aborts it.
+ *
+ * `DEFAULT_IMAGE_TOOL_TIMEOUT_MS` above is a *total* budget: it cannot tell an
+ * endpoint that is still rendering from one whose connection died, so a dead
+ * socket used to hold the tool for the whole three minutes. A generation
+ * endpoint normally answers within 10–60 seconds and a remote image URL within
+ * a few seconds, so two silent minutes only ever fires on a genuinely stalled
+ * request, while the total budget still applies on top.
+ */
+export const IMAGE_TOOL_IDLE_TIMEOUT_MS: number = 120_000
+
+/**
+ * The bounded retry policy for the image paths: at most one extra attempt, and
+ * only for a `429` that states a delay this plugin can parse. Exported so a
+ * host or a test can pass `{ enabled: false }` and get strictly single-shot
+ * requests.
+ */
+export const IMAGE_TOOL_RATE_LIMIT_RETRY_POLICY: RateLimitRetryPolicy = DEFAULT_RATE_LIMIT_RETRY_POLICY
 
 const IMAGE_EXTENSIONS: Record<string, ImageMediaType> = {
   '.png': 'image/png',
@@ -78,6 +110,20 @@ const GENERATE_QUALITIES: readonly string[] = ['auto', 'low', 'medium', 'high', 
 export interface ImageToolHost {
   config: () => Config
   resolveApiKey: (route: string, profile: ProviderProfile) => Promise<string>
+  /**
+   * Override the idle window of one gateway request. Defaults to
+   * {@link IMAGE_TOOL_IDLE_TIMEOUT_MS}; a non-positive value disables the
+   * watchdog.
+   */
+  idleTimeoutMs?: number
+  /** Override the bounded `429` retry policy. Defaults to {@link IMAGE_TOOL_RATE_LIMIT_RETRY_POLICY}. */
+  rateLimitRetry?: RateLimitRetryPolicy
+  /**
+   * Override the endpoint cooldown registry. Defaults to the process-wide
+   * {@link endpointCooldowns}, which the web-search path shares, so one dead
+   * gateway is remembered across both.
+   */
+  endpointCooldowns?: EndpointCooldownTracker
 }
 
 const PROVIDER_LABELS: Record<ProviderKey, string> = {
@@ -215,11 +261,16 @@ async function gatewayFetch(
   signal: AbortSignal | undefined,
   accept: string,
 ): Promise<Response> {
+  // A gateway that keeps failing is parked before the request is even built, so
+  // the caller gets a named reason instead of another full-length stall.
+  const cooldowns = host.endpointCooldowns ?? endpointCooldowns
+  const parked = cooldowns.check(resolved.baseURL)
+  if (parked !== undefined) throw new LlmError(`sub2api: ${parked.message}`, 'TRANSPORT')
   const apiKey = await host.resolveApiKey(resolved.route, resolved.profile)
   const multipart = body instanceof FormData
   let response: Response
   try {
-    response = await fetch(`${resolved.baseURL}${path}`, {
+    const outcome = await fetchWithResilience((attemptSignal) => fetch(`${resolved.baseURL}${path}`, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${apiKey}`,
@@ -230,15 +281,33 @@ async function gatewayFetch(
         ...attributionHeaders(),
       },
       body: multipart ? body : JSON.stringify(body),
+      signal: attemptSignal,
+    }), {
       signal,
+      idleMs: host.idleTimeoutMs ?? IMAGE_TOOL_IDLE_TIMEOUT_MS,
+      policy: host.rateLimitRetry ?? IMAGE_TOOL_RATE_LIMIT_RETRY_POLICY,
     })
+    response = outcome.response
   } catch (error) {
+    // A stalled connection is named as such instead of being folded into the
+    // generic transport failure, so a silent gateway is diagnosable.
+    if (error instanceof HttpIdleTimeoutError) {
+      const note = cooldownNote(cooldowns.recordFailure(resolved.baseURL, TRANSIENT_HTTP_FAILURE))
+      throw new LlmError(`sub2api: gateway stopped sending data for ${error.idleMs}ms (idle timeout)${note}`, 'TRANSPORT', { cause: error })
+    }
     if (signal?.aborted) throw new LlmError('sub2api: request aborted', 'ABORTED', { cause: error })
-    throw new LlmError(`sub2api: API request to ${resolved.baseURL}${path} failed`, 'TRANSPORT', { cause: error })
+    const note = cooldownNote(cooldowns.recordFailure(resolved.baseURL, TRANSIENT_HTTP_FAILURE))
+    throw new LlmError(`sub2api: API request to ${resolved.baseURL}${path} failed${note}`, 'TRANSPORT', { cause: error })
   }
   if (!response.ok) {
-    throw new Error(`sub2api ${path}: ${await readErrorDetail(response)}`)
+    const detail = await readErrorDetail(response)
+    const note = cooldownNote(
+      cooldowns.recordFailure(resolved.baseURL, classifyHttpFailure(response.status, response.headers)),
+    )
+    throw new Error(`sub2api ${path}: ${detail}${note}`)
   }
+  // The gateway answered: whatever it failed with before is history.
+  cooldowns.recordSuccess(resolved.baseURL)
   return response
 }
 
@@ -319,8 +388,15 @@ async function loadRemoteImage(url: string, signal: AbortSignal | undefined, max
   if (encoded !== undefined) return encoded
   let response: Response
   try {
-    response = await fetch(url, { method: 'GET', signal, redirect: 'follow' })
+    const outcome = await fetchWithResilience(
+      (attemptSignal) => fetch(url, { method: 'GET', signal: attemptSignal, redirect: 'follow' }),
+      { signal, idleMs: IMAGE_TOOL_IDLE_TIMEOUT_MS, policy: IMAGE_TOOL_RATE_LIMIT_RETRY_POLICY },
+    )
+    response = outcome.response
   } catch (error) {
+    if (error instanceof HttpIdleTimeoutError) {
+      throw new LlmError(`sub2api: image URL stopped sending data for ${error.idleMs}ms (idle timeout)`, 'TRANSPORT', { cause: error })
+    }
     if (signal?.aborted) throw new LlmError('sub2api: request aborted', 'ABORTED', { cause: error })
     throw new Error(`sub2api: failed to download image URL: ${error instanceof Error ? error.message : String(error)}`)
   }

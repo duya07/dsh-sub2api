@@ -4,6 +4,13 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { registerImageTools } from '../src/image-tools.ts'
+import { EndpointCooldownTracker, RATE_LIMITED_COOLDOWN_MS, endpointCooldowns } from '../src/http-resilience.ts'
+
+// The endpoint cooldown registry is process-wide on purpose, so tests that
+// deliberately fail against the same endpoint must not leak into each other.
+test.beforeEach(() => {
+  endpointCooldowns.clear()
+})
 
 const FAKE_KEY = 'sk-sub2api-fake-key-never-echo'
 // Eight bytes are enough: the media-type sniffer only needs the PNG signature.
@@ -102,6 +109,11 @@ async function toolFixture(options = {}) {
       routes.push(route)
       return options.resolveApiKey === undefined ? FAKE_KEY : options.resolveApiKey(route)
     },
+    // Both are optional host overrides; the tests that exercise resilience pass
+    // them so a watchdog window can be reached without a real 120s wait.
+    ...(options.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: options.idleTimeoutMs }),
+    ...(options.rateLimitRetry === undefined ? {} : { rateLimitRetry: options.rateLimitRetry }),
+    ...(options.endpointCooldowns === undefined ? {} : { endpointCooldowns: options.endpointCooldowns }),
   })
   assert.ok(definition !== undefined, 'the tool was registered')
   return {
@@ -414,4 +426,111 @@ test('the tool declares referenceImages as an ordered 1-5 image reference list',
   } finally {
     await fixture.cleanup()
   }
+})
+
+test('a 429 that states a Retry-After is retried exactly once', async () => {
+  const fixture = await toolFixture()
+  const calls = []
+  try {
+    const result = await withFetch(async (url, init) => {
+      calls.push({ url, init })
+      if (calls.length === 1) {
+        // A stated delay is the only thing that unlocks the single retry, and
+        // `0` keeps the test from actually sleeping through the gateway's wait.
+        return new Response(JSON.stringify({ error: { message: 'rate limited' } }), {
+          status: 429,
+          headers: { 'content-type': 'application/json', 'retry-after': '0' },
+        })
+      }
+      return jsonResponse(b64Payload())
+    }, () => fixture.definition.execute({ prompt: 'a cat' }, fixture.exec))
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0].url, 'https://gw.test/v1/images/generations')
+    assert.equal(result.bytes, PNG.length)
+  } finally {
+    await fixture.cleanup()
+  }
+})
+
+test('a 429 without a stated delay is not retried', async () => {
+  const fixture = await toolFixture()
+  let calls = 0
+  try {
+    await withFetch(async () => {
+      calls += 1
+      return jsonResponse({ error: { message: 'rate limited' } }, 429)
+    }, () => assert.rejects(
+      () => fixture.definition.execute({ prompt: 'a cat' }, fixture.exec),
+      (error) => {
+        assert.match(error.message, /rate limited/)
+        return true
+      },
+    ))
+  } finally {
+    await fixture.cleanup()
+  }
+  // Without Retry-After the plugin cannot know when the window reopens, so it
+  // reports the failure instead of guessing a backoff.
+  assert.equal(calls, 1)
+})
+
+test('a parked endpoint is refused before the gateway is called again', async () => {
+  const clock = { current: 1_000_000 }
+  const tracker = new EndpointCooldownTracker({ now: () => clock.current })
+  const fixture = await toolFixture({ endpointCooldowns: tracker })
+  let calls = 0
+  try {
+    const fail = () => withFetch(async () => {
+      calls += 1
+      return jsonResponse({ error: { message: 'rate limited' } }, 429)
+    }, () => assert.rejects(() => fixture.definition.execute({ prompt: 'a cat' }, fixture.exec)))
+
+    await fail()
+    await fail()
+    assert.equal(calls, 2)
+    assert.ok(tracker.check('https://gw.test/v1') !== undefined, 'two failures parked the endpoint')
+
+    await withFetch(async () => {
+      throw new Error('the gateway must not be called while the endpoint is parked')
+    }, () => assert.rejects(() => fixture.definition.execute({ prompt: 'a cat' }, fixture.exec), (error) => {
+      assert.match(error.message, /cooling down after 2 consecutive failures \(rate-limited\)/)
+      assert.match(error.message, /retry in \d+ms/)
+      return true
+    }))
+    assert.equal(calls, 2, 'the parked endpoint was refused before the request was built')
+
+    clock.current += RATE_LIMITED_COOLDOWN_MS
+    const result = await withFetch(async () => {
+      calls += 1
+      return jsonResponse(b64Payload())
+    }, () => fixture.definition.execute({ prompt: 'a cat' }, fixture.exec))
+    assert.equal(calls, 3)
+    assert.equal(result.bytes, PNG.length)
+    assert.equal(tracker.size(), 0, 'one success forgets the endpoint')
+  } finally {
+    await fixture.cleanup()
+  }
+})
+
+test('a gateway that stops sending data trips the idle watchdog', async () => {
+  // The real window is two minutes; the fixture override keeps the test short.
+  const fixture = await toolFixture({ idleTimeoutMs: 30 })
+  let calls = 0
+  try {
+    await withFetch((url, init) => {
+      calls += 1
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true })
+      })
+    }, () => assert.rejects(
+      () => fixture.definition.execute({ prompt: 'a cat' }, fixture.exec),
+      (error) => {
+        assert.match(error.message, /idle timeout/)
+        return true
+      },
+    ))
+  } finally {
+    await fixture.cleanup()
+  }
+  assert.equal(calls, 1)
 })
