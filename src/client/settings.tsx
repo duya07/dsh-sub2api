@@ -15,6 +15,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ProviderIcon } from './icons.tsx'
 import type { ProviderIconName } from './icons.tsx'
+// The bundled capability table and its id matching live in one place
+// (`src/model-presets.ts`); the client only reads a preset and reports which
+// fields it filled. Matching logic must never be re-implemented here.
+import { lookupModelPreset, presetFieldsToFill } from '../model-presets.ts'
 
 const BASE = '/plugins/dsh-sub2api'
 const MODELS_DEV_API = 'https://models.dev/api.json'
@@ -187,6 +191,11 @@ interface CatalogModel {
   reasoningEfforts?: string[]
   /** claude（anthropic-messages）路由的思考下发方式；缺省 = adaptive。 */
   thinkingMode?: 'adaptive' | 'budget'
+  /**
+   * 逐模型默认思考档（t11）。它只进模型目录、不上 wire：宿主用它决定新对话的
+   * 默认档位，而每次请求实际下发的档位仍由调用方指定。
+   */
+  defaultReasoningEffort?: string
 }
 
 interface ModelRow {
@@ -206,6 +215,10 @@ interface ModelRow {
   fromSaved?: boolean
   /** '' = 缺省（adaptive）; 'budget' = 固定预算（仅老网关需要） */
   thinkingMode: string
+  /** '' = 未设；非空时必须是本行档位列表中的一个（t11 的 defaultReasoningEffort）。 */
+  defaultEffort: string
+  /** 内置能力表填入的字段名，仅用于在界面上标明来源，不提交。 */
+  presetFields?: string[]
 }
 
 interface ProbeState {
@@ -331,7 +344,7 @@ let modelsDevRequest: Promise<ModelsDevCatalog> | undefined
 function modelRow(model: CatalogModel | string = { id: '' }): ModelRow {
   if (typeof model === 'string') {
     const [id = '', name = '', contextWindow = ''] = model.split('|')
-    return { rowId: nextRowId++, id: id.trim(), name: name.trim(), contextWindow: contextWindow.trim(), maxTokens: '', input: '', reasoning: '', effortLevels: '', thinkingMode: '' }
+    return { rowId: nextRowId++, id: id.trim(), name: name.trim(), contextWindow: contextWindow.trim(), maxTokens: '', input: '', reasoning: '', effortLevels: '', thinkingMode: '', defaultEffort: '' }
   }
   const reasoningEfforts = model.reasoningEfforts
   return {
@@ -344,6 +357,7 @@ function modelRow(model: CatalogModel | string = { id: '' }): ModelRow {
     reasoning: reasoningEfforts === undefined ? '' : reasoningEfforts.length === 0 ? 'off' : 'on',
     effortLevels: reasoningEfforts !== undefined && reasoningEfforts.length > 0 ? reasoningEfforts.join(', ') : '',
     thinkingMode: model.thinkingMode === 'budget' ? 'budget' : '',
+    defaultEffort: model.defaultReasoningEffort ?? '',
   }
 }
 
@@ -405,6 +419,63 @@ function officialInput(official: ModelsDevModel): 'text' | 'text-image' | undefi
   if (Array.isArray(input) && input.includes('image')) return 'text-image'
   if (typeof official.attachment === 'boolean') return official.attachment ? 'text-image' : 'text'
   return undefined
+}
+
+/**
+ * Fill a discovered row's empty capacity fields from the bundled capability
+ * table. Id matching and the "only empty fields" rule both live in
+ * `src/model-presets.ts` — this function only projects a row into the shape
+ * that module reads, applies the fields it reports, and records which ones it
+ * wrote so the UI can label them as automatic instead of silently overwriting
+ * what the user typed.
+ */
+function applyPresetDefaults(rows: ModelRow[], baseURL: string): ModelRow[] {
+  return rows.map((row) => {
+    const preset = lookupModelPreset(baseURL, row.id.trim())
+    if (preset === undefined) return row
+    const fields = presetFieldsToFill(
+      {
+        contextWindow: row.contextWindow.trim().length === 0 ? undefined : Number(row.contextWindow),
+        maxTokens: row.maxTokens.trim().length === 0 ? undefined : Number(row.maxTokens),
+        reasoningEfforts: rowDeclaredEfforts(row),
+      },
+      preset,
+      ['contextWindow', 'maxTokens', 'reasoningEfforts'],
+    )
+    if (fields.length === 0) return row
+    let next = row
+    for (const field of fields) {
+      if (field === 'contextWindow' && preset.contextWindow !== undefined) {
+        next = {...next, contextWindow: String(preset.contextWindow)}
+      } else if (field === 'maxTokens' && preset.maxTokens !== undefined) {
+        next = {...next, maxTokens: String(preset.maxTokens)}
+      } else if (field === 'reasoningEfforts' && preset.reasoningEfforts !== undefined) {
+        // A table entry with an empty list means the model does not think at all.
+        next = preset.reasoningEfforts.length > 0
+          ? {...next, reasoning: 'on', effortLevels: preset.reasoningEfforts.join(', ')}
+          : {...next, reasoning: 'off'}
+      }
+    }
+    return {...next, presetFields: [...fields]}
+  })
+}
+
+/**
+ * A row's reasoning levels in the table's vocabulary: `undefined` while the row
+ * is still blank (so the table may fill it), an empty array once the user has
+ * settled on "no levels" (off, or cleared by hand), and the parsed list once the
+ * user turned reasoning on.
+ */
+function rowDeclaredEfforts(row: ModelRow): string[] | undefined {
+  if (row.reasoning === 'off') return []
+  if (row.reasoning === 'on') return [...new Set(row.effortLevels.split(/[,，/\s]+/).filter(Boolean))]
+  return row.reasoningEdited ? [] : undefined
+}
+
+function withoutPresetField(fields: string[] | undefined, field: string): string[] | undefined {
+  if (fields === undefined || !fields.includes(field)) return fields
+  const next = fields.filter((entry) => entry !== field)
+  return next.length === 0 ? undefined : next
 }
 
 function applyOfficialDefaults(rows: ModelRow[], def: ProviderDefinition, catalog: ModelsDevCatalog): { rows: ModelRow[]; filled: number } {
@@ -593,6 +664,14 @@ function serializeModels(rows: readonly ModelRow[], title: string): CatalogModel
       : undefined
     if (row.reasoning === 'on' && !reasoningEfforts?.length) throw new Error(`${title} ${id} 请填写至少一个思考强度`)
     if (reasoningEfforts?.some(level => !['none', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(level))) throw new Error(`${title} ${id} 思考强度支持 none、off、minimal、low、medium、high、xhigh、max`)
+    // The host drops a default this model cannot run; refusing it here names
+    // the row instead of saving a value that silently disappears.
+    const defaultEffort = row.defaultEffort.trim()
+    if (defaultEffort.length > 0) {
+      if (reasoningEfforts === undefined) throw new Error(`${title} ${id} 请先填写该模型的思考强度档位，再设置默认思考档`)
+      if (reasoningEfforts.length === 0) throw new Error(`${title} ${id} 不支持思考，不能设置默认思考档`)
+      if (!reasoningEfforts.includes(defaultEffort)) throw new Error(`${title} ${id} 默认思考档必须是该模型的档位之一：${reasoningEfforts.join('、')}`)
+    }
     const input: Array<'text' | 'image'> | undefined = row.input === 'text-image'
       ? ['text', 'image']
       : row.input === 'text'
@@ -606,6 +685,7 @@ function serializeModels(rows: readonly ModelRow[], title: string): CatalogModel
       ...(input !== undefined ? { input } : {}),
       ...(reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
       ...(row.thinkingMode === 'budget' ? { thinkingMode: 'budget' as const } : {}),
+      ...(defaultEffort.length > 0 ? { defaultReasoningEffort: defaultEffort } : {}),
     }
   })
 }
@@ -841,7 +921,12 @@ export function Sub2ApiSettings() {
       setEndpoints((previous) => previous.map((endpoint) => {
         if (endpoint.rowId !== endpointRowId) return endpoint
         const def = providerDefinition(endpoint.platform)
-        const models = endpoint.models.map((row) => row.rowId === rowId ? applyOfficialDefaults([row], def, catalog).rows[0] ?? row : row)
+        const host = endpoint.baseURL.trim() || baseURL
+        const models = endpoint.models.map((row) => {
+          if (row.rowId !== rowId) return row
+          const presetFilled = applyPresetDefaults([row], host)[0] ?? row
+          return applyOfficialDefaults([presetFilled], def, catalog).rows[0] ?? presetFilled
+        })
         return { ...endpoint, models }
       }))
     } catch {
@@ -859,7 +944,9 @@ export function Sub2ApiSettings() {
     try {
       const catalog = await loadModelsDev()
       if (!mounted.current || revisions.current.get(endpointRowId) !== revision) return
-      setEndpoints((previous) => previous.map((entry) => entry.rowId === endpointRowId ? {...entry, models: applyOfficialDefaults(entry.models, providerDefinition(entry.platform), catalog).rows} : entry))
+      setEndpoints((previous) => previous.map((entry) => entry.rowId === endpointRowId
+        ? {...entry, models: applyOfficialDefaults(applyPresetDefaults(entry.models, entry.baseURL.trim() || baseURL), providerDefinition(entry.platform), catalog).rows}
+        : entry))
       setMessage(`${title} 已补全空白字段，保留手动设置`)
     } catch (e) {
       setError(`无法读取 models.dev：${String(e instanceof Error ? e.message : e)}`)
@@ -986,6 +1073,10 @@ export function Sub2ApiSettings() {
       })
       if (!mounted.current || revisions.current.get(endpointRowId) !== revision) return
       let rows = (res.models ?? []).map(model => endpoint.autoProbeReasoning ? endpoint.models.find(row => row.id === model.id) ?? modelRow(model) : modelRow(model))
+      // The bundled table runs first, models.dev second. Both only fill empty
+      // fields, so the curated per-model value wins wherever the two disagree
+      // about a freshly discovered row.
+      rows = applyPresetDefaults(rows, endpoint.baseURL.trim() || baseURL)
       try {
         rows = applyOfficialDefaults(rows, def, await loadModelsDev()).rows
       } catch {
@@ -1306,6 +1397,15 @@ export function Sub2ApiSettings() {
                       : endpoint.models.map((row) => {
                         const expanded = expandedModels.has(row.rowId)
                         const detailsId = `s2a-model-${row.rowId}-details`
+                        // The default-effort control offers exactly the levels
+                        // this row declares, so a value the model cannot run is
+                        // not selectable in the first place.
+                        const reasoningLevels = row.reasoning === 'on'
+                          ? [...new Set(row.effortLevels.split(/[,，/\s]+/).filter(Boolean))]
+                          : []
+                        const defaultEffortOptions = row.defaultEffort.length > 0 && !reasoningLevels.includes(row.defaultEffort)
+                          ? [row.defaultEffort, ...reasoningLevels]
+                          : reasoningLevels
                         return (
                           <div key={row.rowId} className="s2a_modelItem">
                             <div className="s2a_modelSummary">
@@ -1359,7 +1459,10 @@ export function Sub2ApiSettings() {
                             {expanded && (
                               <div id={detailsId} className="s2a_modelDetails">
                                 <div className="s2a_field">
-                                  <label className="s2a_fieldLabel">上下文窗口</label>
+                                  <label className="s2a_fieldLabel">
+                                    上下文窗口
+                                    {row.presetFields?.includes('contextWindow') ? <span className="s2a_modelSource"> 内置表</span> : null}
+                                  </label>
                                   <input
                                     className="s2a_input"
                                     type="number"
@@ -1368,11 +1471,14 @@ export function Sub2ApiSettings() {
                                     value={row.contextWindow}
                                     placeholder="自动填充"
                                     aria-label={`${title} 上下文窗口`}
-                                    onChange={(event) => updateModel(endpoint.rowId, row.rowId, { contextWindow: event.target.value })}
+                                    onChange={(event) => updateModel(endpoint.rowId, row.rowId, { contextWindow: event.target.value, presetFields: withoutPresetField(row.presetFields, 'contextWindow') })}
                                   />
                                 </div>
                                 <div className="s2a_field">
-                                  <label className="s2a_fieldLabel">最大输出 token</label>
+                                  <label className="s2a_fieldLabel">
+                                    最大输出 token
+                                    {row.presetFields?.includes('maxTokens') ? <span className="s2a_modelSource"> 内置表</span> : null}
+                                  </label>
                                   <input
                                     className="s2a_input"
                                     type="number"
@@ -1381,7 +1487,7 @@ export function Sub2ApiSettings() {
                                     value={row.maxTokens}
                                     placeholder="自动填充"
                                     aria-label={`${title} 最大输出 token`}
-                                    onChange={(event) => updateModel(endpoint.rowId, row.rowId, { maxTokens: event.target.value })}
+                                    onChange={(event) => updateModel(endpoint.rowId, row.rowId, { maxTokens: event.target.value, presetFields: withoutPresetField(row.presetFields, 'maxTokens') })}
                                   />
                                 </div>
                                 <div className="s2a_field">
@@ -1394,17 +1500,38 @@ export function Sub2ApiSettings() {
                                   </select>
                                 </div>
                                 <div className="s2a_field s2a_reasoningField">
-                                  <label className="s2a_fieldLabel">思考强度</label>
+                                  <label className="s2a_fieldLabel">
+                                    思考强度
+                                    {row.presetFields?.includes('reasoningEfforts') ? <span className="s2a_modelSource"> 内置表</span> : null}
+                                  </label>
                                   <select className="s2a_input" aria-label={`${title} ${row.id} 思考模式`} value={row.reasoning}
-                                    onChange={event => updateModel(endpoint.rowId, row.rowId, { reasoning: event.target.value, reasoningEdited: true })}>
+                                    onChange={event => {
+                                      const reasoning = event.target.value
+                                      updateModel(endpoint.rowId, row.rowId, {
+                                        reasoning,
+                                        reasoningEdited: true,
+                                        presetFields: withoutPresetField(row.presetFields, 'reasoningEfforts'),
+                                        ...(reasoning === 'on' ? {} : { defaultEffort: '' }),
+                                      })
+                                    }}>
                                     <option value="">自动</option>
                                     <option value="off">不支持</option>
                                     <option value="on">手动输入档位</option>
                                   </select>
                                   {row.reasoning === 'on' && <input className="s2a_input" value={row.effortLevels}
                                     aria-label={`${title} ${row.id} 思考强度档位`} placeholder="例如 none, low, high, max"
-                                    onChange={event => updateModel(endpoint.rowId, row.rowId, { effortLevels: event.target.value, reasoningEdited: true })} />}
+                                    onChange={event => updateModel(endpoint.rowId, row.rowId, { effortLevels: event.target.value, reasoningEdited: true, presetFields: withoutPresetField(row.presetFields, 'reasoningEfforts') })} />}
                                   <span className="s2a_modelSource">多个档位用逗号分隔。手动设置不会被补全数据覆盖。</span>
+                                </div>
+                                <div className="s2a_field">
+                                  <label className="s2a_fieldLabel">默认思考档</label>
+                                  <select className="s2a_input" aria-label={`${title} ${row.id} 默认思考档`} value={row.defaultEffort}
+                                    disabled={reasoningLevels.length === 0}
+                                    onChange={event => updateModel(endpoint.rowId, row.rowId, { defaultEffort: event.target.value })}>
+                                    <option value="">未设</option>
+                                    {defaultEffortOptions.map(level => <option key={level} value={level}>{level}</option>)}
+                                  </select>
+                                  <span className="s2a_modelSource">{reasoningLevels.length === 0 ? '先填写该模型的思考强度档位' : '新对话未指定档位时使用；候选值限该模型的档位'}</span>
                                 </div>
                               </div>
                             )}
@@ -1415,6 +1542,9 @@ export function Sub2ApiSettings() {
                   <div className="s2a_modelFooter">
                     <span className="s2a_modelSource">
                       默认值来自 <a href="https://models.dev/" target="_blank" rel="noreferrer">models.dev</a>，未匹配时可手动填写
+                    </span>
+                    <span className="s2a_modelSource">
+                      标「内置表」的是补全数据按内置能力表填的建议值，保存后生效；重新加载已有配置时不再区分建议值与手填值。
                     </span>
                     <div className="s2a_modelActions">
                       <button className="s2a_btn" disabled={busy.length > 0 || endpoint.models.length === 0} onClick={() => fillProvider(endpoint.rowId)}>

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {setImmediate} from 'node:timers/promises'
-import {ReasoningProbeService, ProbeScheduler, createSdkProbeTransport, classifyProbeError, inspectProbeWire, retryAfterMs, loadPeerProbeSdk, probeWireModel} from '../src/reasoning-probe.ts'
+import {ReasoningProbeService, ProbeScheduler, createSdkProbeTransport, classifyProbeError, inspectProbeWire, retryAfterMs, loadPeerProbeSdk, probeWireModel, probeWireBudget, probeThinkingBudget, PROBE_MAX_TOKENS_CEILING} from '../src/reasoning-probe.ts'
 import {probeDraft, protocols, sseFrames, sseResponse} from './reasoning-fixtures.mjs'
 import {translateToPiAi} from '../src/pi-ai.ts'
 
@@ -395,7 +395,7 @@ test('R3 omitted capabilities inherit translated capacities and keep the real re
       assert.equal(result.kind, 'accepted')
     }
     const tokens = body => api === 'openai-responses' ? body.max_output_tokens : api === 'openai-completions' ? body.max_completion_tokens ?? body.max_tokens : body.max_tokens
-    assert.deepEqual(forwarded, [false, false])
+    assert.deepEqual(forwarded, [true, true], 'the output budget is always stated, so the number judged is the number requested')
     assert.equal(tokens(normalBody), 8192)
     assert.equal(tokens(bodies[0]), 8192)
     if (api === 'anthropic-messages') {
@@ -418,6 +418,76 @@ test('the probe model carries the translated anthropic compat so the wire shape 
   }
 })
 
+// The cap cannot be the model's own declared size, so the probe ceiling has to
+// be pinned from both sides. Lower bound (derivation): it must host the deepest
+// thinking budget with an equal allowance left for the answer. Upper bound
+// (measurement): the anthropic route validates `max_tokens` per model and states
+// its own cap in the 400 body, so the ceiling has to stay below the smallest cap
+// the catalog's upstreams actually enforce. Both bounds are in 09-ceiling-probe.md.
+const SMALLEST_MEASURED_UPSTREAM_OUTPUT_CAP = 64000
+test('the probe cap is the model ceiling bounded by a stated probe ceiling', () => {
+  for (const declared of [8192, 32768, 131072, 2000000]) {
+    const draft = probeDraft('openai-responses', ['high'])
+    const model = probeWireModel({...draft, model: {...draft.model, maxTokens: declared}})
+    assert.equal(probeWireBudget(model, 'high').cap, Math.min(declared, PROBE_MAX_TOKENS_CEILING), `declared ${declared}`)
+  }
+  assert.ok(PROBE_MAX_TOKENS_CEILING < 131072, 'a declared 131072 must still be bounded')
+  assert.ok(PROBE_MAX_TOKENS_CEILING >= 2 * probeThinkingBudget('high'), 'the ceiling must host the deepest budget plus an equal answer allowance')
+  // Measured on claude-haiku-4-5 / claude-opus-4-5-20251101 (64000) and on the
+  // opus-5 / sonnet-5 / fable-5 families (128000). Asking above the cap is a
+  // 400 invalid_request_error naming the cap, i.e. a rejected probe, not a probe.
+  assert.ok(PROBE_MAX_TOKENS_CEILING <= SMALLEST_MEASURED_UPSTREAM_OUTPUT_CAP, 'the ceiling must stay below the smallest measured upstream output cap')
+  assert.equal(probeThinkingBudget('max'), probeThinkingBudget('high'), 'xhigh and max fold onto high')
+  assert.equal(probeThinkingBudget('off'), undefined)
+  assert.equal(probeThinkingBudget(undefined), undefined)
+})
+
+// The budget-based anthropic shape adds its thinking budget to the requested
+// output budget, so a probe that asks for the cap puts `cap + budget` on the
+// wire and is judged budget-limited on every level, forever. The request has to
+// leave room for the budget instead — and only for the shape that sends one.
+test('the budget-based anthropic shape asks for the remainder so the added budget lands on the cap', () => {
+  const adaptive = probeWireModel(probeDraft('anthropic-messages', ['low', 'high', 'max']))
+  assert.equal(adaptive.compat?.forceAdaptiveThinking, true)
+  const legacy = {...adaptive, compat: {}}
+  for (const level of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
+    const budget = probeThinkingBudget(level)
+    assert.ok(budget > 0, level)
+    const adaptiveWire = probeWireBudget(adaptive, level)
+    assert.equal(adaptiveWire.maxTokens, adaptiveWire.cap, `${level}: the adaptive shape sends no budget, so it asks for the cap`)
+    const wire = probeWireBudget(legacy, level)
+    assert.equal(wire.maxTokens + budget, wire.cap, `${level}: the budget must not be added on top of the cap`)
+    const payload = {thinking: {type: 'enabled', budget_tokens: budget}, max_tokens: wire.maxTokens + budget}
+    const verdict = inspectProbeWire('anthropic-messages', level, payload, wire.cap)
+    assert.equal(verdict.exact, true, `${level}: ${JSON.stringify(verdict)}`)
+  }
+  // A cap that cannot host the budget still stays above the minimum answer room.
+  const tiny = probeWireBudget({...legacy, maxTokens: 2048}, 'high')
+  assert.equal(tiny.cap, 2048)
+  assert.equal(tiny.maxTokens, 1024)
+})
+
+// The probe's product is evidence, not configuration: the service can report on
+// levels but has no way to write the catalog, the endpoint or the model row.
+// `private` is erased at runtime, so the guard is on the names it offers.
+test('the probe service exposes no way to write a configuration', () => {
+  const names = Object.getOwnPropertyNames(ReasoningProbeService.prototype)
+  const writers = names.filter(name => /apply|save|write|persist|store|update|patch|commit|set/i.test(name))
+  assert.deepEqual(writers, [], 'a probe reports; it must not grow a method that writes a configuration')
+  assert.ok(names.includes('start'), 'and this is still the service under test')
+})
+
+test('a probe cannot mutate the caller draft it was started from', async () => {
+  const draft = probeDraft('openai-responses', ['high'])
+  const before = JSON.stringify(draft)
+  const time = clock()
+  const service = new ReasoningProbeService(async ({draft: working}) => {working.model.maxTokens = 1; working.model.contextWindow = 1; return accepted}, time.scheduler, time.now)
+  let view
+  try {view = await settle(service, service.start(draft, 'fakekey').id)} finally {service.dispose()}
+  assert.equal(view.levels[0].state, 'accepted', 'the probe ran, against its own clone')
+  assert.equal(JSON.stringify(draft), before, 'the caller draft is untouched')
+})
+
 test('an anthropic model declaring more output than the probe cap still probes every level on the wire', async () => {
   const draft = probeDraft('anthropic-messages', ['low', 'high']); draft.model.maxTokens = 131072
   const bodies = []
@@ -430,10 +500,11 @@ test('an anthropic model declaring more output than the probe cap still probes e
   assert.deepEqual(bodies.map(body => body.output_config.effort), ['low', 'high'])
 })
 
-// The probe always asks for `maxTokens: cap`, so a model whose own maxTokens is
-// larger says nothing about the payload. Predicting "budget-limited" from that
-// number stranded every openai level before a request went out; the SDK's own
-// payload is the only thing that decides now, for every protocol.
+// The probe asks for `probeWireBudget(model, level).maxTokens`, so a model whose
+// own maxTokens is larger says nothing about the payload. Predicting
+// "budget-limited" from that number stranded every openai level before a request
+// went out; the SDK's own payload is the only thing that decides now, for every
+// protocol.
 test('an openai model declaring more output than the probe cap still sends every level on the wire', async () => {
   for (const api of ['openai-responses', 'openai-completions']) {
     const draft = probeDraft(api, ['low', 'medium', 'high', 'xhigh', 'max']); draft.model.maxTokens = 128000

@@ -22,11 +22,26 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { PiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai';
-import type { Config, ProviderEndpoint, ProviderKey } from './index.ts';
+import type { CatalogModel, Config, ProviderEndpoint, ProviderKey } from './index.ts';
 /./index.jstings namespace owned by dsh-llm-pi-ai. */
 export declare const PI_AI_NS = "llm-pi-ai";
 /** Route prefix this plugin's groups own in the llm-pi-ai profile dict. */
 export declare const ROUTE_PREFIX: string;
+/**
+ * Catalog fields that never reach a pi-ai profile.
+ *
+ * `defaultReasoningEffort` is a per-model *preference* the host has no slot for:
+ * `PiAiModelProfile` (dsh-llm-pi-ai `lib/types/catalog.d.ts`) carries no
+ * per-model default, and the only default pi-ai knows is route-level
+ * (`PiAiProviderProfile.reasoning`) — promoting one model's preference there
+ * would change every other model on the same route. The field therefore lives in
+ * the `llm-sub2api` section and in the built-in preset table only, and
+ * `translateModel` leaves it out on purpose.
+ *
+ * `thinkingMode` is the other one: it selects the dispatch shape and is folded
+ * into `compat` / `reasoningEfforts` rather than copied verbatim.
+ */
+export declare const CATALOG_ONLY_FIELDS: readonly (keyof CatalogModel)[];
 export type { PiAiModelProfile, PiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai';
 /** The llm-pi-ai settings section value this plugin writes. */
 export interface PiAiSettingsSection {

@@ -44,6 +44,22 @@ export const PI_AI_NS = 'llm-pi-ai'
 /** Route prefix this plugin's groups own in the llm-pi-ai profile dict. */
 export const ROUTE_PREFIX: string = 'sub2api-'
 
+/**
+ * Catalog fields that never reach a pi-ai profile.
+ *
+ * `defaultReasoningEffort` is a per-model *preference* the host has no slot for:
+ * `PiAiModelProfile` (dsh-llm-pi-ai `lib/types/catalog.d.ts`) carries no
+ * per-model default, and the only default pi-ai knows is route-level
+ * (`PiAiProviderProfile.reasoning`) — promoting one model's preference there
+ * would change every other model on the same route. The field therefore lives in
+ * the `llm-sub2api` section and in the built-in preset table only, and
+ * `translateModel` leaves it out on purpose.
+ *
+ * `thinkingMode` is the other one: it selects the dispatch shape and is folded
+ * into `compat` / `reasoningEfforts` rather than copied verbatim.
+ */
+export const CATALOG_ONLY_FIELDS: readonly (keyof CatalogModel)[] = ['defaultReasoningEffort', 'thinkingMode']
+
 /** pi-ai thinking levels a profile may declare (catalog `THINKING_LEVELS`). */
 const THINKING_LEVELS: readonly string[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 
@@ -129,6 +145,10 @@ function translateModel(model: CatalogModel, api: ApiProtocol): PiAiModelProfile
   // `thinkingMode: 'budget'` asks for the legacy fixed-budget shape instead.
   const adaptive = api === 'anthropic-messages' && model.thinkingMode !== 'budget'
   const reasoningEfforts = translateReasoningEfforts(model, adaptive)
+  // `defaultReasoningEffort` is deliberately absent from the object below — see
+  // CATALOG_ONLY_FIELDS: pi-ai has no per-model default slot, and the route-level
+  // `reasoning` it does have would leak one model's preference onto every other
+  // model on the route. The level stays a llm-sub2api concern.
   return {
     id: model.id,
     ...(model.name !== undefined && model.name.length > 0 ? { name: model.name } : {}),

@@ -18,7 +18,7 @@ import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { assertUsableApiKey } from '@deepseek-ai/dsh-llm'
-import { API_PROTOCOLS, MAX_STREAM_IDLE_TIMEOUT_MS, PROVIDERS, gatewayApiRoot, type ApiProtocol, type CatalogModel, type Config, type ImageToolModelRef, type ImageToolsConfig, type ProviderEndpoint, type ProviderKey, type ProviderProfile, type WebSearchToolConfig } from './index.ts'
+import { API_PROTOCOLS, MAX_STREAM_IDLE_TIMEOUT_MS, PROVIDERS, gatewayApiRoot, offeredReasoningLevels, type ApiProtocol, type CatalogModel, type Config, type ImageToolModelRef, type ImageToolsConfig, type ProviderEndpoint, type ProviderKey, type ProviderProfile, type WebSearchToolConfig } from './index.ts'
 import { endpointRoute, platformLabel } from './pi-ai.ts'
 import { ReasoningProbeService, parseProbeDraft } from './reasoning-probe.ts'
 
@@ -190,6 +190,17 @@ function structuredCatalogModel(value: unknown): CatalogModel | undefined {
   const reasoningEfforts = Array.isArray(raw.reasoningEfforts)
     ? (raw.reasoningEfforts as unknown[]).filter((effort): effort is string => typeof effort === 'string' && effort.length > 0)
     : undefined
+  // A default level must name a level this model actually offers. The effective
+  // set is the model's own list when it declares one (an explicit empty array
+  // offers none), otherwise the settings schema's default vocabulary — the same
+  // list an absent `reasoningEfforts` falls back to. A value outside that set is
+  // dropped, never rewritten: rewriting would silently overrule the user, and
+  // keeping it would persist a level the picker cannot show.
+  const offeredEfforts = offeredReasoningLevels(reasoningEfforts)
+  const requestedDefault = typeof raw.defaultReasoningEffort === 'string' ? raw.defaultReasoningEffort.trim() : ''
+  const defaultReasoningEffort = requestedDefault.length > 0 && offeredEfforts.includes(requestedDefault)
+    ? requestedDefault
+    : undefined
   // 'adaptive' / 'budget' is the only accepted spelling; anything else is
   // dropped so a stored catalog keeps matching the settings schema.
   const thinkingMode = raw.thinkingMode === 'adaptive' || raw.thinkingMode === 'budget' ? raw.thinkingMode : undefined
@@ -202,6 +213,7 @@ function structuredCatalogModel(value: unknown): CatalogModel | undefined {
     ...(contextWindow !== undefined ? { contextWindow } : {}),
     ...(maxTokens !== undefined ? { maxTokens } : {}),
     ...(reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
+    ...(defaultReasoningEffort !== undefined ? { defaultReasoningEffort } : {}),
     ...(thinkingMode !== undefined ? { thinkingMode } : {}),
     ...(input !== undefined && input.length > 0 ? { input } : {}),
   }

@@ -77,6 +77,18 @@ export declare class ProbeScheduler {
     pauseUntil(until: number): void;
     run<T extends AttemptResult>(signal: AbortSignal, action: () => Promise<T>): Promise<T>;
 }
+/**
+ * Verification, not generation.
+ *
+ * The probe's only product is a `ProbeView`: per-level evidence about the
+ * levels the user already declared, plus a suggestion. It never writes a
+ * configuration — not the catalog, not the endpoint, not the model row — and it
+ * does not decide which levels a model supports. The static table and the
+ * user's own declarations stay authoritative; a probe that cannot run, or that
+ * ends without a confirmed rejection, leaves them exactly as they were and the
+ * level is reported as unknown. The caller keeps the draft it handed in
+ * (cloned below), so a failed probe cannot even mutate its input.
+ */
 export declare class ReasoningProbeService {
     private readonly tasks;
     private disposed;
@@ -129,6 +141,57 @@ type SdkModule = {
 export type SdkLoader = (api: ApiProtocol) => Promise<SdkModule>;
 export declare function loadPeerProbeSdk(api: ApiProtocol): Promise<SdkModule>;
 export declare function probeWireModel(draft: ProbeDraft): WireModel;
+/**
+ * Hard ceiling for the output budget a probe may put on the wire.
+ *
+ * Two measured bounds fix this number; neither is decoration.
+ *
+ * Lower bound — it must be at least the deepest fixed thinking budget plus an
+ * equal allowance for the answer itself. The budget-based anthropic shape adds
+ * its thinking budget on top of the requested output budget, so a ceiling below
+ * twice the deepest budget could never probe that shape exactly. Twice the
+ * deepest budget is the smallest value that can.
+ *
+ * Upper bound — it must stay below the smallest output cap the upstreams behind
+ * this catalog actually enforce. On the anthropic route the upstream validates
+ * `max_tokens` per model and states its own cap in the 400 body (measured:
+ * 64000 for claude-haiku-4-5 and claude-opus-4-5, 128000 for the opus-5 /
+ * sonnet-5 / fable-5 families), so a probe that asked for more than the model's
+ * cap would be rejected instead of probed. The openai route does not validate at
+ * all (measured: 9999999 was answered, not rejected and not stalled), so there
+ * the ceiling is what keeps a probe's declared budget honest.
+ *
+ * Both bounds are met by the same value, so this is the smallest ceiling that
+ * works rather than a number chosen to make the code run.
+ * Evidence: `sub2api-ref/cc-switch-port/09-ceiling-probe.md`.
+ */
+export declare const PROBE_MAX_TOKENS_CEILING: number;
+/** The thinking budget pi-ai will add for this level, or undefined when it adds none. */
+export declare function probeThinkingBudget(level: ProbeLevel | undefined): number | undefined;
+export interface ProbeWireBudget {
+    cap: number;
+    maxTokens: number;
+}
+/**
+ * The single place that decides how much output a probe asks for and how much
+ * it will accept, so the request and the verdict cannot disagree.
+ *
+ * `cap` is the model's own output ceiling bounded by the probe ceiling, and it
+ * is the number `inspectProbeWire` judges the payload against. `maxTokens` is
+ * chosen so that what the SDK builds lands on that cap for either anthropic
+ * thinking shape:
+ *
+ * - the adaptive shape and the openai protocols put the requested value on the
+ *   wire unchanged, so the probe asks for the cap;
+ * - the budget-based shape adds the thinking budget on top of it
+ *   (`min(base + budget, model.maxTokens)`), so asking for the cap would put
+ *   `cap + budget` on the wire and be judged budget-limited on every level,
+ *   forever. Asking for `cap - budget` makes the sum land on the cap again.
+ *
+ * The budget is only subtracted for the shape that actually adds one, so a
+ * small model cap is never spent on a budget that is not sent.
+ */
+export declare function probeWireBudget(model: WireModel, level: ProbeLevel | undefined): ProbeWireBudget;
 interface ExactWire {
     exact: boolean;
     reason: ProbeReason;

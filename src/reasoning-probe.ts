@@ -113,6 +113,18 @@ export class ProbeScheduler {
 // One scheduler per loaded server module, not per browser, route or endpoint.
 const sharedScheduler = new ProbeScheduler()
 interface ProbeTask { view: ProbeView; draft: ProbeDraft; key: string; controller: AbortController; timer: ReturnType<typeof setTimeout>; touched: number }
+/**
+ * Verification, not generation.
+ *
+ * The probe's only product is a `ProbeView`: per-level evidence about the
+ * levels the user already declared, plus a suggestion. It never writes a
+ * configuration — not the catalog, not the endpoint, not the model row — and it
+ * does not decide which levels a model supports. The static table and the
+ * user's own declarations stay authoritative; a probe that cannot run, or that
+ * ends without a confirmed rejection, leaves them exactly as they were and the
+ * level is reported as unknown. The caller keeps the draft it handed in
+ * (cloned below), so a failed probe cannot even mutate its input.
+ */
 export class ReasoningProbeService {
   private readonly tasks = new Map<string, ProbeTask>()
   private disposed = false
@@ -267,6 +279,73 @@ export function probeWireModel(draft: ProbeDraft): WireModel {
   return {id: model.id, name: model.name ?? model.id, api: profile.api as ApiProtocol, provider: route, baseUrl: profile.baseURL!, input: model.input ?? ['text'], cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}, contextWindow: model.contextWindow ?? profile.defaultContextWindow!, maxTokens: model.maxTokens ?? profile.defaultMaxTokens!, reasoning: true, thinkingLevelMap: map, compat: model.compat}
 }
 
+// The fixed thinking budgets pi-ai assigns per level (its `DEFAULT_THINKING_BUDGETS`),
+// with xhigh/max folded onto `high` exactly as its `clampReasoning` folds them.
+// A probe has to know them, because the budget-based anthropic shape adds the
+// budget on top of the output budget it was asked for.
+const PROBE_THINKING_BUDGETS: Readonly<Partial<Record<ProbeLevel, number>>> = {minimal: 1024, low: 2048, medium: 8192, high: 16384}
+const PROBE_DEEPEST_THINKING_BUDGET = 16384
+// Below this the payload is not worth judging: inspectProbeWire rejects it anyway.
+const PROBE_MIN_MAX_TOKENS = 1024
+/**
+ * Hard ceiling for the output budget a probe may put on the wire.
+ *
+ * Two measured bounds fix this number; neither is decoration.
+ *
+ * Lower bound — it must be at least the deepest fixed thinking budget plus an
+ * equal allowance for the answer itself. The budget-based anthropic shape adds
+ * its thinking budget on top of the requested output budget, so a ceiling below
+ * twice the deepest budget could never probe that shape exactly. Twice the
+ * deepest budget is the smallest value that can.
+ *
+ * Upper bound — it must stay below the smallest output cap the upstreams behind
+ * this catalog actually enforce. On the anthropic route the upstream validates
+ * `max_tokens` per model and states its own cap in the 400 body (measured:
+ * 64000 for claude-haiku-4-5 and claude-opus-4-5, 128000 for the opus-5 /
+ * sonnet-5 / fable-5 families), so a probe that asked for more than the model's
+ * cap would be rejected instead of probed. The openai route does not validate at
+ * all (measured: 9999999 was answered, not rejected and not stalled), so there
+ * the ceiling is what keeps a probe's declared budget honest.
+ *
+ * Both bounds are met by the same value, so this is the smallest ceiling that
+ * works rather than a number chosen to make the code run.
+ * Evidence: `sub2api-ref/cc-switch-port/09-ceiling-probe.md`.
+ */
+export const PROBE_MAX_TOKENS_CEILING: number = PROBE_DEEPEST_THINKING_BUDGET * 2
+
+/** The thinking budget pi-ai will add for this level, or undefined when it adds none. */
+export function probeThinkingBudget(level: ProbeLevel | undefined): number | undefined {
+  if (level === undefined || level === 'off' || level === 'none') return undefined
+  return PROBE_THINKING_BUDGETS[level === 'xhigh' || level === 'max' ? 'high' : level]
+}
+
+export interface ProbeWireBudget { cap: number; maxTokens: number }
+/**
+ * The single place that decides how much output a probe asks for and how much
+ * it will accept, so the request and the verdict cannot disagree.
+ *
+ * `cap` is the model's own output ceiling bounded by the probe ceiling, and it
+ * is the number `inspectProbeWire` judges the payload against. `maxTokens` is
+ * chosen so that what the SDK builds lands on that cap for either anthropic
+ * thinking shape:
+ *
+ * - the adaptive shape and the openai protocols put the requested value on the
+ *   wire unchanged, so the probe asks for the cap;
+ * - the budget-based shape adds the thinking budget on top of it
+ *   (`min(base + budget, model.maxTokens)`), so asking for the cap would put
+ *   `cap + budget` on the wire and be judged budget-limited on every level,
+ *   forever. Asking for `cap - budget` makes the sum land on the cap again.
+ *
+ * The budget is only subtracted for the shape that actually adds one, so a
+ * small model cap is never spent on a budget that is not sent.
+ */
+export function probeWireBudget(model: WireModel, level: ProbeLevel | undefined): ProbeWireBudget {
+  const cap = Math.min(model.maxTokens, PROBE_MAX_TOKENS_CEILING)
+  const budget = model.api === 'anthropic-messages' && model.compat?.forceAdaptiveThinking !== true ? probeThinkingBudget(level) : undefined
+  const maxTokens = budget === undefined ? cap : Math.max(PROBE_MIN_MAX_TOKENS, Math.min(cap, cap - budget))
+  return {cap, maxTokens}
+}
+
 interface ExactWire { exact: boolean; reason: ProbeReason; parameter?: string; value?: string }
 // A parameter-not-exact verdict only says "the parameter did not survive the SDK".
 // That is not actionable on its own, so whenever the wire payload was readable
@@ -301,8 +380,10 @@ export function inspectProbeWire(api: ApiProtocol, level: ProbeLevel | undefined
     if (effort !== level) return notExact('output_config.effort', effort)
     return {exact: true, reason: 'accepted-parameter', parameter: 'output_config.effort', value: level}
   }
-  const budgets: Partial<Record<ProbeLevel, number>> = {minimal: 1024, low: 2048, medium: 8192, high: 16384}
-  const budget = budgets[level]
+  // The same budget table the request was built from, so a level can never be
+  // judged against a budget the probe did not ask for. xhigh and max fold onto
+  // `high` here exactly as pi-ai folds them on the way out.
+  const budget = probeThinkingBudget(level)
   if (!budget || thinking?.type !== 'enabled') return notExact('thinking.type', thinking?.type)
   if (thinking.budget_tokens !== budget || typeof payload.max_tokens !== 'number' || payload.max_tokens < budget + 1024 || payload.max_tokens > cap) return {exact: false, reason: 'budget-limited'}
   // Budgets encode the host's level but an error about numeric tokens cannot reject an effort enum.
@@ -410,16 +491,17 @@ export function createSdkProbeTransport(options: {fetch?: typeof fetch; loadSdk?
   return async ({draft, key, level, signal, sent, now = options.now ?? Date.now, pauseUntil}) => {
     let sdk: SdkModule
     try {sdk = await (options.loadSdk ?? loadPeerProbeSdk)(draft.endpoint.api)} catch {return {kind: 'unknown', reason: 'sdk-unavailable', transmitted: false}}
-    const model = probeWireModel(draft), cap = Math.min(model.maxTokens, 32768)
+    const model = probeWireModel(draft), wire = probeWireBudget(model, level)
     // Predicting a budget conclusion from the model's own maxTokens was wrong
     // for every protocol, so nothing is short-circuited here any more. The
-    // probe always asks for `maxTokens: cap`, and what reaches the wire is the
-    // SDK's own arithmetic on top of that: an anthropic model adds its thinking
-    // budget to max_tokens and clamps the result to its own cap, while an
-    // openai-family model writes max_output_tokens = the cap it was given.
-    // maxTokens > cap therefore implies nothing about the payload, and guessing
-    // "budget-limited" from it stranded all five levels before a single request
-    // went out. inspectProbeWire judges the payload the SDK actually built.
+    // probe asks for `wire.maxTokens`, and what reaches the wire is the SDK's
+    // own arithmetic on top of that: the budget-based anthropic shape adds its
+    // thinking budget and clamps the result to the model's own cap, while the
+    // adaptive shape and the openai-family protocols write the requested value
+    // out unchanged. maxTokens > cap therefore implies nothing about the
+    // payload, and guessing "budget-limited" from it stranded all five levels
+    // before a single request went out. inspectProbeWire judges the payload the
+    // SDK actually built, against the same cap this request was built from.
     let outcome: AttemptResult | undefined, transmitted = false, calls = 0
     let pause: Pick<AttemptResult, 'retryAfterMs' | 'retryAfterUntil'> = {}
     const evidence: StreamEvidence = {terminal: false, stopped: false, model: false, error: false, text: false}
@@ -427,10 +509,10 @@ export function createSdkProbeTransport(options: {fetch?: typeof fetch; loadSdk?
       if (signal.aborted || calls++) throw new Error('cancelled')
       let payload: Record<string, unknown> | undefined
       try {payload = object(JSON.parse(String(init?.body ?? '')))} catch { /* Missing JSON is not verifiable. */ }
-      const exact = payload ? inspectProbeWire(model.api, level, payload, cap) : {exact: false, reason: 'parameter-not-exact' as const}
+      const exact = payload ? inspectProbeWire(model.api, level, payload, wire.cap) : {exact: false, reason: 'parameter-not-exact' as const}
       // Carry the two numbers the verdict was computed from, so the UI can state
       // why a level never went out instead of only naming the reason.
-      const budget = exact.reason === 'budget-limited' ? {maxTokens: model.maxTokens, cap} : {}
+      const budget = exact.reason === 'budget-limited' ? {maxTokens: model.maxTokens, cap: wire.cap} : {}
       // A not-exact verdict carries the wire parameter and the value that went
       // out, so the level can be rendered with the difference it observed.
       const mismatch = exact.reason === 'parameter-not-exact' ? {parameter: exact.parameter, value: exact.value} : {}
@@ -452,7 +534,10 @@ export function createSdkProbeTransport(options: {fetch?: typeof fetch; loadSdk?
       return observedBody(response, model.api, model.id, evidence)
     }
     try {
-      const stream = sdk.streamSimple(model, {messages: [{role: 'user', content: 'Reply exactly OK.', timestamp: 0}]}, {apiKey: key, ...(draft.model.maxTokens === undefined ? {} : {maxTokens: cap}), maxRetries: 0, signal, fetch: independentFetch, ...(level === undefined || level === 'off' || level === 'none' ? {} : {reasoning: level})})
+      // The cap is always stated, even when the catalog omits an output size:
+      // the number judged and the number requested have to be the same one, and
+      // an implicit value is whatever the profile default happens to be.
+      const stream = sdk.streamSimple(model, {messages: [{role: 'user', content: 'Reply exactly OK.', timestamp: 0}]}, {apiKey: key, maxTokens: wire.maxTokens, maxRetries: 0, signal, fetch: independentFetch, ...(level === undefined || level === 'off' || level === 'none' ? {} : {reasoning: level})})
       const result = await stream.result()
       if (signal.aborted) return {kind: 'unknown', reason: 'cancelled', transmitted, ...pause}
       if (outcome) return outcome

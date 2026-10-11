@@ -104,6 +104,20 @@ export interface CatalogModel {
      */
     reasoningEfforts?: string[];
     /**
+     * Reasoning level this model starts on when the user has not picked one.
+     * Absent: no per-model preference — the picker keeps the host's own default,
+     * and {@link resolveDefaultReasoningEffort} may still find a suggestion in the
+     * built-in preset table (`src/model-presets.ts`). A level stored here wins
+     * over that table.
+     *
+     * Must name one of this model's {@link reasoningEfforts}; the submission route
+     * drops a value outside that set rather than rewriting it, because a rewritten
+     * level would silently overrule the user. Never translated into a pi-ai
+     * profile: `PiAiModelProfile` has no per-model default, so this field lives
+     * only in this section and in the built-in table.
+     */
+    defaultReasoningEffort?: string;
+    /**
      * Thinking dispatch this model's levels use on an `anthropic-messages` route.
      * Absent: `adaptive` (see {@link ThinkingMode}). Set `budget` only for a
      * gateway that still rejects adaptive thinking. Ignored on OpenAI-style
@@ -111,6 +125,28 @@ export interface CatalogModel {
      */
     thinkingMode?: ThinkingMode;
 }
+/**
+ * Anything that may suggest a default reasoning level for one model: a stored
+ * catalog entry, or a built-in preset (`src/model-presets.ts`).
+ */
+export interface DefaultReasoningEffortSource {
+    defaultReasoningEffort?: string;
+}
+/**
+ * Resolve the default reasoning level for one model: a stored catalog entry
+ * wins, the built-in preset table is the fallback, and nothing is invented.
+ *
+ * The order is fixed — `model.defaultReasoningEffort ??
+ * preset.defaultReasoningEffort` — and never reversed: a level the user stored
+ * is a decision, while a level the built-in table carries is only a suggestion.
+ * That is the same contract {@link fillMissingModelFields} follows.
+ *
+ * The value is returned verbatim, including one outside the model's
+ * `reasoningEfforts`: rewriting it here would decide for the user, and
+ * membership is enforced once, on the submission path. Blank strings count as
+ * unset, so an input the user emptied does not suppress the preset suggestion.
+ */
+export declare function resolveDefaultReasoningEffort(model: DefaultReasoningEffortSource, preset?: DefaultReasoningEffortSource): string | undefined;
 export interface ProviderProfile {
     /** Credential reference (environment-variable name) resolved per request through `ctx.credentials`. */
     apiKeyEnv?: string;
@@ -163,6 +199,57 @@ export interface ProviderEndpoint {
      */
     streamIdleTimeoutMs?: number;
 }
+/**
+ * The levels a model may be asked for: its own declaration, or the schema's
+ * default vocabulary when it declares none.
+ *
+ * `[]` stays `[]` — a model whose levels were emptied (an image model, a model
+ * with no reasoning) must not be offered the default vocabulary. Shared by the
+ * submission route's membership check and the host-side preset fill so the two
+ * can never disagree about what a model offers.
+ */
+export declare function offeredReasoningLevels(declared: readonly string[] | undefined): readonly string[];
+/**
+ * Whether a model's declared levels are exactly the schema's default vocabulary.
+ *
+ * `catalogModel.reasoningEfforts` carries `.default(REASONING_EFFORTS ids)`, so
+ * `Config({...})` materializes that vocabulary onto every model that declared
+ * none — by the time the preset fill runs, "the user never chose" and "the user
+ * chose exactly the default list" are the same three strings. The fill treats
+ * the schema's own vocabulary as unset, so the built-in table's narrower list
+ * can still apply (P0-F8 repair, F1).
+ *
+ * The trade-off is deliberate: a user who wants `low, medium, high` on a model
+ * the table knows cannot be told apart from one who never chose, so the table
+ * wins on this path. Editing any other level of that row is the way to keep a
+ * list of your own — the settings page says so next to the table.
+ */
+export declare function isSchemaDefaultVocabulary(declared: readonly string[] | undefined): boolean;
+/**
+ * Fill one endpoint's models from the built-in capability table and resolve the
+ * per-model default reasoning level (P0-F8).
+ *
+ * `llm-sub2api.endpoints[].models[]` is the authoritative catalog; everything
+ * downstream — the settings page's echo, `syncPiAiProfiles`, and the pi-ai
+ * profile the host actually requests with — is derived from what this returns.
+ * Without this step a model the user never sized reaches pi-ai with no
+ * `contextWindow`/`maxTokens`, and the host falls back to its own defaults
+ * instead of the table's measured values.
+ *
+ * Two decisions, both "suggest, never overwrite":
+ *   1. every *empty* field is filled from the preset
+ *      ({@link fillMissingModelFields});
+ *   2. a model carrying no default level of its own takes the preset's
+ *      suggestion, but only when the model actually offers that level —
+ *      {@link resolveDefaultReasoningEffort} decides the first half, the
+ *      membership check the second. A suggestion outside the model's levels is
+ *      dropped rather than stored: storing it would put a level in the catalog
+ *      that the model cannot be asked for.
+ *
+ * Returns `endpoint` itself when nothing changed, so the caller keeps the
+ * derived JSON byte-stable and the host's idempotence guard quiet.
+ */
+export declare function withPresetDefaults(endpoint: ProviderEndpoint, fallbackBaseURL: string): ProviderEndpoint;
 /** One dedicated model used by a global image tool, independent of the chat route. */
 export interface ImageToolModelRef {
     /** Sub2API platform that owns the key and catalog (`openai` / `claude` / `grok`). */
