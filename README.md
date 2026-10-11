@@ -2,7 +2,7 @@
 
 [中文文档](./README.zh.md) | [Changelog](./CHANGELOG.md)
 
-Connect a [Sub2API](https://github.com/Wei-Shaw/sub2api) gateway to [DeepSeek Harness](https://github.com/deepseek-ai/dsh). This is the **duya07/dsh-sub2api** fork of GodD6366's plugin, based on upstream commit `610ff6f26370a587223cff27449ea894ad87da96`. The package identity remains `@godd6366/dsh-sub2api`, version `0.2.1-dsh02.12`; that name does not identify a new fork release on npm. This delivery is not an npm publication.
+Connect a [Sub2API](https://github.com/Wei-Shaw/sub2api) gateway to [DeepSeek Harness](https://github.com/deepseek-ai/dsh). This is the **duya07/dsh-sub2api** fork of GodD6366's plugin, based on upstream commit `610ff6f26370a587223cff27449ea894ad87da96`. The package identity remains `@godd6366/dsh-sub2api`, version `0.2.1-dsh02.14`; that name does not identify a new fork release on npm. This delivery is not an npm publication.
 
 ## Changes Relative To Upstream
 
@@ -31,7 +31,7 @@ Not adopted from reviewed projects: subscription logins, account pools, quota di
 
 The local adaptation was verified with **DSH 0.2.0-rc.2** and **desktop 2.0.17**. Other versions are not covered by this verification.
 
-- The full suite (253 tests, including packaging and cross-platform wait regressions) and server/client typechecks passed. Behaviors above were covered by mutation tests that fail when the fix is removed.
+- The full suite (350 tests, including packaging and cross-platform wait regressions) and server/client typechecks passed. Behaviors above were covered by mutation tests that fail when the fix is removed.
 - The HTTP-resilience work (item 13) is verified offline with mocked transports: both fetch paths are exercised end to end for a stated `429` (retried exactly once), an unstated `429` (not retried) and a gateway that stops sending data (idle timeout), alongside the parser, classification and watchdog unit cases. No real rate-limited or stalled gateway was exercised.
 - Endpoint cooldowns (item 14) are verified offline as well: the new cases cover key normalization, the threshold, the memory window, expiry, success-clears, the three kind spans, stated-delay precedence, the ceiling, the `permanent` no-op, the 64-endpoint cap with eviction, and both fetch paths end to end (a parked endpoint refused before the request is built, the reason visible on the error, recovery once the deadline passes). No real rate-limited gateway was exercised.
 - Browser checks (192 cases, 2,320 assertions, four viewport sizes) were run on the earlier 0.2.1-dsh02.5 build; they have not been re-run for the later additions.
@@ -52,7 +52,7 @@ npm ci --ignore-scripts
 npm run typecheck
 npm test
 npm pack --ignore-scripts
-dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.12.tgz
+dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.14.tgz
 ```
 
 `npm test` runs the build before the tests, so the tarball includes freshly built `lib` assets even though lifecycle scripts are disabled during install and packing. The tarball name above follows the current package name and version; use the actual filename printed by `npm pack` if they change. Restart DSH/desktop after adding the plugin. If your active profile is not `desktop`, replace `desktop` with your own profile name.

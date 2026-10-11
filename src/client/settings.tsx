@@ -1406,6 +1406,12 @@ export function Sub2ApiSettings() {
                         const defaultEffortOptions = row.defaultEffort.length > 0 && !reasoningLevels.includes(row.defaultEffort)
                           ? [row.defaultEffort, ...reasoningLevels]
                           : reasoningLevels
+                        // The table's suggestion is offered as a placeholder
+                        // rather than written into the row: an empty field still
+                        // means "fill me", so the value only lands when the user
+                        // asks for it and the user can see what it would be
+                        // first. Same endpoint-first address the fill path uses.
+                        const preset = lookupModelPreset(endpoint.baseURL.trim() || baseURL, row.id.trim())
                         return (
                           <div key={row.rowId} className="s2a_modelItem">
                             <div className="s2a_modelSummary">
@@ -1469,7 +1475,7 @@ export function Sub2ApiSettings() {
                                     min="1"
                                     step="1"
                                     value={row.contextWindow}
-                                    placeholder="自动填充"
+                                    placeholder={preset?.contextWindow !== undefined ? String(preset.contextWindow) : undefined}
                                     aria-label={`${title} 上下文窗口`}
                                     onChange={(event) => updateModel(endpoint.rowId, row.rowId, { contextWindow: event.target.value, presetFields: withoutPresetField(row.presetFields, 'contextWindow') })}
                                   />
@@ -1485,7 +1491,7 @@ export function Sub2ApiSettings() {
                                     min="1"
                                     step="1"
                                     value={row.maxTokens}
-                                    placeholder="自动填充"
+                                    placeholder={preset?.maxTokens !== undefined ? String(preset.maxTokens) : undefined}
                                     aria-label={`${title} 最大输出 token`}
                                     onChange={(event) => updateModel(endpoint.rowId, row.rowId, { maxTokens: event.target.value, presetFields: withoutPresetField(row.presetFields, 'maxTokens') })}
                                   />
@@ -1521,7 +1527,7 @@ export function Sub2ApiSettings() {
                                   {row.reasoning === 'on' && <input className="s2a_input" value={row.effortLevels}
                                     aria-label={`${title} ${row.id} 思考强度档位`} placeholder="例如 none, low, high, max"
                                     onChange={event => updateModel(endpoint.rowId, row.rowId, { effortLevels: event.target.value, reasoningEdited: true, presetFields: withoutPresetField(row.presetFields, 'reasoningEfforts') })} />}
-                                  <span className="s2a_modelSource">多个档位用逗号分隔。手动设置不会被补全数据覆盖。</span>
+                                  <span className="s2a_modelSource">多个档位用逗号分隔。手动设置不会被「补全数据」覆盖（保存后后端仍可能按内置能力表改写，见下方说明）。</span>
                                 </div>
                                 <div className="s2a_field">
                                   <label className="s2a_fieldLabel">默认思考档</label>
@@ -1544,7 +1550,13 @@ export function Sub2ApiSettings() {
                       默认值来自 <a href="https://models.dev/" target="_blank" rel="noreferrer">models.dev</a>，未匹配时可手动填写
                     </span>
                     <span className="s2a_modelSource">
-                      标「内置表」的是补全数据按内置能力表填的建议值，保存后生效；重新加载已有配置时不再区分建议值与手填值。
+                      标「内置表」的是补全数据按内置能力表填的建议值，保存后生效；重新加载已有配置时不再区分建议值与手填值。上下文窗口与输出上限留空时，输入框里的灰字就是内置表的建议值。
+                    </span>
+                    <span className="s2a_modelSource">
+                      手填的档位恰好是 low、medium、high 三档时，点「补全数据」不会改动它：后端会在保存后按内置能力表里的档位改写（表里多数模型不是这三档），重新加载配置才能看到结果。
+                    </span>
+                    <span className="s2a_modelSource">
+                      保存时，默认档若不在该模型生效的档位列表内（不论档位有没有被改写），会换成表里的建议档，表里没有建议档则清空；显式的空数组（如 input: []）视为未填，会被内置能力表覆盖。
                     </span>
                     <div className="s2a_modelActions">
                       <button className="s2a_btn" disabled={busy.length > 0 || endpoint.models.length === 0} onClick={() => fillProvider(endpoint.rowId)}>

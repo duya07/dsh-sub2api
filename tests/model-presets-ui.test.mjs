@@ -80,9 +80,18 @@ async function page(options = {}) {
   const presetTags = (node) => node.findAll(entry => typeof entry.props.className === 'string'
     && entry.props.className.includes('s2a_modelSource')
     && entry.children.join('').includes('内置表'))
+  const textOf = (node) => {
+    if (typeof node === 'string') return node
+    if (node.children === undefined || node.children === null) return ''
+    return node.children.map(textOf).join('')
+  }
+  const footerText = () => view.root
+    .findAll(node => typeof node.props.className === 'string' && node.props.className.includes('s2a_modelFooter'))
+    .map(textOf)
+    .join('')
   const status = () => view.root.findAll(node => typeof node.props.className === 'string' && node.props.className.includes('s2a_statusErr'))
   return {
-    view, saved, button, field, change, click, modelRows, modelRow, expandModel, presetTags, status,
+    view, saved, button, field, change, click, modelRows, modelRow, expandModel, presetTags, status, footerText,
     async expandEndpoint() { await click(field('展开 Team A 端点')) },
     async discover() { await click(button(view.root, '获取模型')) },
     async fill() { await click(button(view.root, '补全数据')) },
@@ -249,5 +258,124 @@ test('a whitespace-only capacity counts as empty for the table', async () => {
     await p.fill()
     if (p.modelRow(0).findAllByProps({ 'aria-label': 'Team A 上下文窗口' }).length === 0) await p.expandModel(0)
     assert.equal(p.modelRow(0).findByProps({ 'aria-label': 'Team A 上下文窗口' }).props.value, '256000')
+  } finally { await p.close() }
+})
+
+test('an empty capacity field shows the table suggestion as its placeholder', async () => {
+  // The suggestion is the only place a user can see what the table would fill
+  // before committing to it; the field itself stays empty so "only empty fields
+  // are filled" keeps working.
+  const p = await page({ config: fixture([{ id: 'glm-5.3' }]) })
+  try {
+    const preset = lookupModelPreset('https://a.test', 'glm-5.3')
+    assert.ok(preset, 'glm-5.3 is in the table')
+    assert.ok(preset.contextWindow !== undefined && preset.maxTokens !== undefined, 'the table carries both capacities')
+    await p.expandEndpoint()
+    await p.expandModel(0)
+    assert.equal(p.modelRow(0).findByProps({ 'aria-label': 'Team A 上下文窗口' }).props.value, '')
+    assert.equal(p.modelRow(0).findByProps({ 'aria-label': 'Team A 上下文窗口' }).props.placeholder, String(preset.contextWindow))
+    assert.equal(p.modelRow(0).findByProps({ 'aria-label': 'Team A 最大输出 token' }).props.value, '')
+    assert.equal(p.modelRow(0).findByProps({ 'aria-label': 'Team A 最大输出 token' }).props.placeholder, String(preset.maxTokens))
+  } finally { await p.close() }
+})
+
+test('a model the table does not know gets no capacity placeholder', async () => {
+  // A placeholder reading "自动填充" would promise a fill that never comes for an
+  // id the table has never heard of.
+  const p = await page({ config: fixture([{ id: 'unknown-model-xyz' }]) })
+  try {
+    await p.expandEndpoint()
+    await p.expandModel(0)
+    assert.equal(p.modelRow(0).findByProps({ 'aria-label': 'Team A 上下文窗口' }).props.placeholder, undefined)
+    assert.equal(p.modelRow(0).findByProps({ 'aria-label': 'Team A 最大输出 token' }).props.placeholder, undefined)
+  } finally { await p.close() }
+})
+
+test('a hand-typed capacity is kept, and clearing it hands the field back to the table', async () => {
+  const p = await page({ config: fixture([{ id: 'glm-5.3' }]) })
+  try {
+    await p.expandEndpoint()
+    await p.expandModel(0)
+    const capacity = () => p.modelRow(0).findByProps({ 'aria-label': 'Team A 上下文窗口' })
+    await p.fill()
+    if (p.modelRow(0).findAllByProps({ 'aria-label': 'Team A 上下文窗口' }).length === 0) await p.expandModel(0)
+    assert.equal(capacity().props.value, '256000')
+    const filled = p.presetTags(p.modelRow(0)).length
+    assert.ok(filled > 0, 'the table-filled field is labelled')
+    await p.change(capacity(), '999')
+    assert.equal(capacity().props.value, '999')
+    assert.equal(p.presetTags(p.modelRow(0)).length, filled - 1, 'editing the field drops its automatic label')
+    await p.fill()
+    assert.equal(capacity().props.value, '999', 'the fill button leaves a hand-typed value alone')
+    await p.change(capacity(), '')
+    assert.equal(capacity().props.value, '')
+    await p.fill()
+    assert.equal(capacity().props.value, '256000', 'a cleared field is the table\'s to fill again')
+    // `presetFields` records the fields *this* fill wrote, so the refilled field
+    // is the only one labelled again.
+    assert.equal(p.presetTags(p.modelRow(0)).length, 1, 'and the refilled field is labelled again')
+  } finally { await p.close() }
+})
+
+test('a hand-typed capacity survives a save and comes back on the next load', async () => {
+  const p = await page({ config: fixture([{ id: 'glm-5.3' }]) })
+  try {
+    await p.expandEndpoint()
+    await p.expandModel(0)
+    await p.change(p.modelRow(0).findByProps({ 'aria-label': 'Team A 上下文窗口' }), '999')
+    await p.change(p.modelRow(0).findByProps({ 'aria-label': 'Team A 最大输出 token' }), '111')
+    await p.save()
+    assert.equal(p.saved.length, 1)
+    assert.deepEqual(p.saved[0].endpoints[0].models, [{ id: 'glm-5.3', contextWindow: 999, maxTokens: 111 }])
+  } finally { await p.close() }
+  const reloaded = await page({ config: fixture([{ id: 'glm-5.3', contextWindow: 999, maxTokens: 111 }]) })
+  try {
+    await reloaded.expandEndpoint()
+    await reloaded.expandModel(0)
+    assert.equal(reloaded.modelRow(0).findByProps({ 'aria-label': 'Team A 上下文窗口' }).props.value, '999')
+    assert.equal(reloaded.modelRow(0).findByProps({ 'aria-label': 'Team A 最大输出 token' }).props.value, '111')
+  } finally { await reloaded.close() }
+})
+
+test('clearing a capacity drops it from the payload instead of storing a blank', async () => {
+  const p = await page({ config: fixture([{ id: 'glm-5.3', contextWindow: 999, maxTokens: 111 }]) })
+  try {
+    await p.expandEndpoint()
+    await p.expandModel(0)
+    await p.change(p.modelRow(0).findByProps({ 'aria-label': 'Team A 上下文窗口' }), '')
+    await p.change(p.modelRow(0).findByProps({ 'aria-label': 'Team A 最大输出 token' }), '')
+    await p.save()
+    assert.equal(p.saved.length, 1)
+    assert.deepEqual(p.saved[0].endpoints[0].models, [{ id: 'glm-5.3' }])
+  } finally { await p.close() }
+})
+
+test('an invalid capacity is refused with a visible message instead of being saved', async () => {
+  const p = await page({ config: fixture([{ id: 'glm-5.3' }]) })
+  try {
+    await p.expandEndpoint()
+    await p.expandModel(0)
+    for (const bad of ['0', '-5', '1.5', 'abc']) {
+      await p.change(p.modelRow(0).findByProps({ 'aria-label': 'Team A 上下文窗口' }), bad)
+      await p.save()
+      assert.equal(p.saved.length, 0, `${bad} must not reach the server`)
+      assert.equal(p.status().length, 1, `${bad} must be reported`)
+      assert.match(p.status()[0].children.join(''), /Context Window 必须是正整数/)
+    }
+  } finally { await p.close() }
+})
+
+test('the footer describes what the page does, and when the host rewrites a hand-typed list', async () => {
+  // t26 N1: the footer used to promise an immediate label for a rewrite the page
+  // never performs. It must describe the page's own behaviour and name the
+  // moment the host one happens instead.
+  const p = await page({ config: fixture([{ id: 'glm-5.3' }]) })
+  try {
+    await p.expandEndpoint()
+    const footer = p.footerText()
+    assert.match(footer, /点「补全数据」不会改动它/, 'the page states that a hand-typed list is left alone')
+    assert.match(footer, /保存后/, 'the host rewrite is described as happening on save')
+    assert.doesNotMatch(footer, /改后会在该行标出/, 'the footer no longer promises a label for the host rewrite')
+    assert.match(footer, /显式的空数组/, 'the third fill path is disclosed (t26 N3)')
   } finally { await p.close() }
 })

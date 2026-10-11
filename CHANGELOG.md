@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1-dsh02.14
+
+- A default reasoning level the user typed is no longer dropped in silence. When the built-in table rewrites a hand-typed level list, and the table's suggested default is not in the rewritten list, that key is now deleted instead of being left as a value the route layer would ignore without saying so.
+- The settings page lets you type the context window and the max output tokens for a model, and what you type wins over the built-in table. The page states what the fill does: a value filled in becomes your own on the next save and stops following later table updates.
+- Verification: 350 tests (was 341) plus server/client typechecks. The 9 new cases cover the host-path rewrite of a hand-typed default, the key dropped when the table has no runnable suggestion, the round-trip of both window fields through the settings echo, and the placeholder that says a filled value becomes the user's own. Mocked registries and a stubbed settings host; no real DSH restart was exercised.
+
+## 0.2.1-dsh02.13
+
+- The built-in model preset table reaches the host path. It had been blocked by the settings schema: `reasoningEfforts` carries `.default(REASONING_EFFORTS)`, so the host materialises the default vocabulary onto every model that did not declare it, which made "the user did not say" indistinguishable from "the user said exactly the default". The table now compares a declared list against the default vocabulary item by item — length, order, and every value — before treating it as unset.
+- `PROBE_MAX_TOKENS_CEILING` is no longer an arbitrary number. It is `32768`, the meeting point of a lower bound (2 × 16384, because a budgeted Anthropic thinking shape needs an equal amount of room left for the answer) and an upper bound (64000, the smallest real per-model output cap measured). 27 real upstream calls also corrected an earlier belief about this gateway: it does validate `max_tokens` on the Anthropic route, per model, and reports the real cap in the 400 body (`64000` / `128000`, matching the declared catalogue for all 9 reachable models), while the OpenAI route does not validate it at all.
+- The table covers both window fields and both effort fields, and only fills what is empty. A value the user typed always wins.
+- Verification: 341 tests (was 268) plus server/client typechecks. The new cases cover the schema-vocabulary comparison, the host-path fill for both window fields and both effort fields, the preserve-what-was-typed rule, and the measured ceiling bounds. The probe cases run on mocked transports; the ceiling bounds come from 27 real upstream calls recorded in the porting notes.
+
 ## 0.2.1-dsh02.12
 
 - The image tool no longer loses a name fight. `generate_image` is registered by dsh-image-gen as well, and the host refuses the second registrant of one name (`tool "generate_image" is already registered ...`), so whichever plugin loaded last used to lose its image tool entirely. This plugin now registers `sub2api_generate_image` by default and keeps the upstream name as an opt-in alias (`tools.generate.compatToolName`, off by default) that is only attempted while `generate_image` is still free: a name another tool already owns is left alone (`isToolNameTaken`) and the host's own duplicate rejection is swallowed (`isOwnDuplicateNameError`) instead of failing the load. Two plugins now load in either order without displacing each other.

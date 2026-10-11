@@ -219,10 +219,12 @@ export declare function offeredReasoningLevels(declared: readonly string[] | und
  * the schema's own vocabulary as unset, so the built-in table's narrower list
  * can still apply (P0-F8 repair, F1).
  *
- * The trade-off is deliberate: a user who wants `low, medium, high` on a model
- * the table knows cannot be told apart from one who never chose, so the table
- * wins on this path. Editing any other level of that row is the way to keep a
- * list of your own — the settings page says so next to the table.
+ * The trade-off is deliberate, and the settings page's footer states it next to
+ * the table: a user who types `low, medium, high` on a model the table knows
+ * cannot be told apart from one who never chose, so the table wins on this
+ * path. Editing any other level of that row is the way to keep a list of your
+ * own. What the rewrite does to a default level it invalidates is documented on
+ * {@link withPresetDefaults}.
  */
 export declare function isSchemaDefaultVocabulary(declared: readonly string[] | undefined): boolean;
 /**
@@ -244,7 +246,19 @@ export declare function isSchemaDefaultVocabulary(declared: readonly string[] | 
  *      {@link resolveDefaultReasoningEffort} decides the first half, the
  *      membership check the second. A suggestion outside the model's levels is
  *      dropped rather than stored: storing it would put a level in the catalog
- *      that the model cannot be asked for.
+ *      that the model cannot be asked for;
+ *   3. a default level the user did set survives only while the model still
+ *      offers it. When the table rewrites the level list (see
+ *      {@link isSchemaDefaultVocabulary}) and the user's level falls outside the
+ *      new one, the fill replaces it with the table's suggestion — or drops it
+ *      when the table has none. An invalidated default must not travel on: the
+ *      submission route would discard it there without a word.
+ *
+ * What this writes is what the settings echo returns, and the page saves what
+ * it echoes: a value filled here becomes the user's own on the next save and
+ * stops following later table updates. That is the intended posture (the
+ * page's footer says so). Re-applying the table to a row that already carries
+ * values would overrule edits the user made by hand.
  *
  * Returns `endpoint` itself when nothing changed, so the caller keeps the
  * derived JSON byte-stable and the host's idempotence guard quiet.

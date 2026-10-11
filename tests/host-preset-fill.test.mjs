@@ -142,6 +142,36 @@ test('a suggestion the model cannot run is dropped, not stored', () => {
   assert.equal(filled.defaultReasoningEffort, undefined)
 })
 
+test('a hand-typed list equal to the schema vocabulary is the table\'s to rewrite', () => {
+  // The documented trade-off (see `isSchemaDefaultVocabulary`): a hand-typed
+  // `low, medium, high` cannot be told apart from an absent list, so the table
+  // wins. What must not survive is the user's default sitting outside the list
+  // the rewrite produced — that inconsistent pair used to travel to the
+  // submission route and be dropped there, silently (F2/F3).
+  const typed = {
+    id: 'glm-5.3',
+    reasoningEfforts: ['low', 'medium', 'high'],
+    defaultReasoningEffort: 'medium',
+  }
+  const filled = withPresetDefaults(endpoint([typed]), 'https://fallback.test').models[0]
+  assert.deepEqual(filled.reasoningEfforts, ['low', 'high', 'max'])
+  assert.equal(filled.defaultReasoningEffort, 'high', 'the table suggestion replaces the invalidated default')
+})
+
+test('a rewritten list drops a default the table has no suggestion for', () => {
+  // `kimi-k3` declares levels and deliberately no default. Once the table's
+  // list replaces the materialized one, a level the model can no longer be
+  // asked for must not stay in the catalog.
+  const typed = {
+    id: 'kimi-k3',
+    reasoningEfforts: ['low', 'medium', 'high'],
+    defaultReasoningEffort: 'medium',
+  }
+  const filled = withPresetDefaults(endpoint([typed]), 'https://fallback.test').models[0]
+  assert.deepEqual(filled.reasoningEfforts, ['low', 'high', 'max'])
+  assert.equal('defaultReasoningEffort' in filled, false)
+})
+
 test('a model that does not think at all gets no default level', () => {
   const filled = withPresetDefaults(endpoint([{ id: 'glm-5.3', reasoningEfforts: [] }]), 'https://fallback.test').models[0]
   assert.deepEqual(filled.reasoningEfforts, [])

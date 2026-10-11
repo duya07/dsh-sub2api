@@ -195,7 +195,11 @@ function structuredCatalogModel(value: unknown): CatalogModel | undefined {
   // offers none), otherwise the settings schema's default vocabulary — the same
   // list an absent `reasoningEfforts` falls back to. A value outside that set is
   // dropped, never rewritten: rewriting would silently overrule the user, and
-  // keeping it would persist a level the picker cannot show.
+  // keeping it would persist a level the picker cannot show. The host-side fill
+  // already replaces or clears any default the offered levels do not carry,
+  // whether or not the levels themselves were rewritten (see
+  // `withPresetDefaults`), so this check is the last line of defence for a
+  // payload that reaches the route without passing through it.
   const offeredEfforts = offeredReasoningLevels(reasoningEfforts)
   const requestedDefault = typeof raw.defaultReasoningEffort === 'string' ? raw.defaultReasoningEffort.trim() : ''
   const defaultReasoningEffort = requestedDefault.length > 0 && offeredEfforts.includes(requestedDefault)

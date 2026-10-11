@@ -2,7 +2,7 @@
 
 [English](./README.md) | [变更记录](./CHANGELOG.md)
 
-将 [Sub2API](https://github.com/Wei-Shaw/sub2api) 网关接入 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)。这是 **duya07/dsh-sub2api** fork，基于 GodD6366 上游提交 `610ff6f26370a587223cff27449ea894ad87da96`。包名暂保持 `@godd6366/dsh-sub2api`，版本为 `0.2.1-dsh02.12`；保留包名不表示 npm 上已有此 fork 的新版本。本次交付不是 npm 发布。
+将 [Sub2API](https://github.com/Wei-Shaw/sub2api) 网关接入 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)。这是 **duya07/dsh-sub2api** fork，基于 GodD6366 上游提交 `610ff6f26370a587223cff27449ea894ad87da96`。包名暂保持 `@godd6366/dsh-sub2api`，版本为 `0.2.1-dsh02.14`；保留包名不表示 npm 上已有此 fork 的新版本。本次交付不是 npm 发布。
 
 ## 相较上游的更新点
 
@@ -31,7 +31,7 @@
 
 本地适配已在 **DSH 0.2.0-rc.2**、**desktop 2.0.17** 上验证，不承诺其他版本兼容。
 
-- 完整测试套件（253 项，含 packaging 与跨平台等待回归）及服务端、客户端类型检查通过；上述行为均有变异测试，移除修复后测试会变红。
+- 完整测试套件（350 项，含 packaging 与跨平台等待回归）及服务端、客户端类型检查通过；上述行为均有变异测试，移除修复后测试会变红。
 - HTTP 韧性改动（第 13 条）为离线验证，使用 mock 传输层：两条 fetch 路径都做了端到端覆盖——带延迟的 `429`（恰好重试一次）、不带延迟的 `429`（不重试）、以及停止发送数据的网关（空闲超时）——另有解析、分类与看门狗的单测。未在真实限流或挂起的网关上验证。
 - 端点冷却（第 14 条）同样为离线验证：新增用例覆盖键归一化、阈值、记忆窗口、过期、成功即清除、三档时长、上游延迟优先、冷却上限、`permanent` 不记录、64 端点上限与淘汰，以及两条 fetch 路径的端到端行为（冷却中的端点在发出请求前即被拒、错误中可见原因、截止后恢复）。未在真实限流网关上验证。
 - 浏览器检查（192 个案例、2,320 次断言、四种视口尺寸）是在较早的 0.2.1-dsh02.5 构建上做的，之后新增的内容未重跑。
@@ -52,7 +52,7 @@ npm ci --ignore-scripts
 npm run typecheck
 npm test
 npm pack --ignore-scripts
-dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.12.tgz
+dsh plugin --profile desktop add ./godd6366-dsh-sub2api-0.2.1-dsh02.14.tgz
 ```
 
 `npm test` 会先构建再测试，因此即使安装、打包时禁用了生命周期脚本，打出的包仍包含刚构建的 `lib` 产物。上述 tgz 名称来自当前包名与版本；若它们发生变化，请使用 `npm pack` 实际输出的文件名。安装后重启 DSH/desktop。若使用的不是 `desktop` profile，将命令中的 `desktop` 换成自己的 profile 名称。
